@@ -1,0 +1,7282 @@
+import express from "express";
+import bcrypt from "bcrypt";
+import crypto from "crypto";
+import jwt from "jsonwebtoken";
+import { clearProductsCache, clearProductCache } from "../lib/redis.js";
+import { permanentlyDeleteProducts } from "../lib/productCleanup.js";
+import { logActivity, logActivityBulk } from "../lib/activityLog.js";
+import { actorLabel, isHiddenAdmin } from "../lib/attribution.js";
+import mongoose from "mongoose";
+import multer from "multer";
+import { v2 as cloudinary } from "cloudinary";
+import {
+  saveLocalUpload,
+  requestUploadBase,
+  destroyAsset,
+  copyLocalAsset,
+  listLocalMedia,
+  deleteLocalAsset,
+  isLocalPublicId,
+} from "../lib/assetStore.js";
+import Admin from "../models/Admin.js";
+import User from "../models/User.js";
+import CheckoutSession from "../models/CheckoutSession.js";
+import CustomerTag from "../models/CustomerTag.js";
+import PackagingCost from "../models/PackagingCost.js";
+import DropshippingCost from "../models/DropshippingCost.js";
+import Barcode from "../models/Barcode.js";
+import Product from "../models/Product.js";
+import ActivityLog from "../models/ActivityLog.js";
+import FAQ from "../models/FAQ.js";
+import Variation from "../models/Variation.js";
+import BlogPost from "../models/BlogPost.js";
+import BlogCategory from "../models/BlogCategory.js";
+import Order from "../models/Order.js";
+import Subscriber from "../models/Subscriber.js";
+import Courier from "../models/Courier.js";
+import TimelinePreset from "../models/TimelinePreset.js";
+import {
+  formatOrderIdSuffix,
+  orderIdMatchConditions,
+} from "../lib/orderLookup.js";
+import {
+  requirePermission,
+  requireAnyPermission,
+  sanitizePermissions,
+  hasPermission,
+} from "../lib/permissions.js";
+import categoryRoutes from "./category.js";
+import { defaultTrackingUrl } from "../lib/couriers/constants.js";
+import {
+  getCourierSyncConfig,
+  isCourierSyncConfigured,
+} from "../lib/couriers/syncConfig.js";
+import {
+  getCourierIntegration,
+  saveCourierCredentials,
+  maskCredentialsForSlug,
+  listBookableCouriers,
+  isIntegrationSlug,
+} from "../lib/courierCredentials.js";
+import { testCourierConnection } from "../lib/couriers/testConnection.js";
+import { bookParcelWithCourier } from "../lib/couriers/bookParcel.js";
+import { fetchRedxAreas } from "../lib/couriers/createRedxOrder.js";
+import {
+  ensureDefaultCouriers,
+  ensureDefaultTimelinePresets,
+  buildTrackingUrl,
+  isValidCourierSlug,
+} from "../lib/courierDefaults.js";
+import {
+  applyOrderStatusChange,
+  appendStatusHistory,
+  recordOrderEditor,
+} from "../lib/orderStatus.js";
+import {
+  computeCustomerAnalytics,
+  summarizeOrdersForList,
+} from "../lib/customerAnalytics.js";
+import { fetchLifetimeCourierStats } from "../lib/courierFraudCheck.js";
+import {
+  creditOrderRewardPoints,
+  POINTS_PER_TK,
+  pointsToTk,
+  enrichOrderItemsWithRewardPoints,
+  calcItemsRewardPoints,
+} from "../lib/rewards.js";
+import {
+  appendAdminTrackingEvent,
+  appendManualTrackingEvent,
+  syncOrderShipment,
+} from "../lib/shipmentTracking.js";
+import { sendOrderCancelledEmail } from "../lib/mailer.js";
+import { resolveAndQuote } from "./orders.js";
+
+const router = express.Router();
+const SALT_ROUNDS = 12; // Increased from 10 for better security
+
+const normalizeVariationOptionValue = (option) =>
+  String(
+    (option && typeof option === "object" ? option.value : option) ?? "",
+  ).trim();
+const normalizeBarcodeCode = (value) =>
+  String(value || "")
+    .trim()
+    .replace(/\s+/g, "");
+
+const generateBarcodeCode = () => {
+  const base = `${Date.now()}${Math.floor(Math.random() * 900000 + 100000)}`;
+  return base.slice(0, 12);
+};
+
+const syncProductBarcode = async ({
+  productId,
+  productTitle,
+  barcode,
+  createdBy,
+}) => {
+  const code = normalizeBarcodeCode(barcode);
+  if (!code) return null;
+
+  const existing = await Barcode.findOne({ code });
+  if (
+    existing &&
+    existing.product &&
+    existing.product.toString() !== String(productId)
+  ) {
+    const err = new Error("Barcode already exists");
+    err.status = 409;
+    throw err;
+  }
+
+  const record = await Barcode.findOneAndUpdate(
+    { code },
+    {
+      $set: {
+        code,
+        label: productTitle || existing?.label || "",
+        product: productId,
+        productTitle: productTitle || "",
+        createdBy: createdBy || existing?.createdBy || null,
+        isActive: true,
+      },
+    },
+    { upsert: true, new: true, runValidators: true },
+  );
+
+  await Barcode.updateMany(
+    { product: productId, code: { $ne: code } },
+    { $set: { product: null, productTitle: "" } },
+  );
+  await Product.updateOne({ _id: productId }, { $set: { barcode: code } });
+
+  return record;
+};
+
+const detachBarcodeFromProduct = async (productId, keepCode = null) => {
+  const filter = { product: productId };
+  if (keepCode) {
+    filter.code = { $ne: keepCode };
+  }
+  await Barcode.updateMany(filter, {
+    $set: { product: null, productTitle: "" },
+  });
+  await Product.updateOne({ _id: productId }, { $unset: { barcode: "" } });
+};
+
+const createToken = (admin) => {
+  const payload = { id: admin._id, role: admin.role, type: "admin" };
+  return jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: "7d" });
+};
+
+// --- Cloudinary + upload setup ---
+let cloudinaryConfigured = false;
+const ensureCloudinaryConfigured = () => {
+  if (!cloudinaryConfigured) {
+    cloudinary.config({
+      cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+      api_key: process.env.CLOUDINARY_API_KEY,
+      api_secret: process.env.CLOUDINARY_API_SECRET,
+    });
+    cloudinaryConfigured = true;
+  }
+};
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+});
+
+// Middleware to require admin JWT cookie
+const requireAdmin = async (req, res, next) => {
+  try {
+    const token = req.cookies?.token;
+    if (!token) return res.status(401).json({ error: "Not authenticated" });
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    if (payload.type !== "admin")
+      return res.status(403).json({ error: "Admin access required" });
+    const admin = await Admin.findById(payload.id);
+    if (!admin) return res.status(403).json({ error: "Admin not found" });
+    if (!admin.isActive)
+      return res.status(403).json({ error: "Account disabled" });
+    req.admin = admin;
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: "Invalid token" });
+  }
+};
+
+// Admin / Moderator registration endpoint has been superseded by manual seeding.
+// Keeping route for compatibility, but reject all requests to prevent self-registration.
+router.post("/register", async (req, res) => {
+  return res.status(403).json({
+    error:
+      "Admin registration is disabled. Please contact an existing administrator.",
+  });
+});
+
+// Check if email already exists as admin (same email can be user + admin)
+// still available even though registration is off
+router.post("/check-email", async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: "Email is required" });
+
+    // Only check if already exists as admin (allow same email for user)
+    const existingAdmin = await Admin.findOne({ email: email.toLowerCase() });
+    if (existingAdmin) {
+      return res.status(400).json({
+        exists: true,
+        error: "This email is already registered as an admin.",
+      });
+    }
+
+    res.json({ exists: false, ok: true });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Cloudinary signed-upload params — frontend uploads directly, bypassing Vercel body limit
+router.get("/upload/sign", requireAdmin, (req, res) => {
+  try {
+    ensureCloudinaryConfigured();
+    const timestamp = Math.round(Date.now() / 1000);
+    const folder = String(
+      req.query.folder ||
+        `${process.env.CLOUDINARY_FOLDER || "applebd"}/products`,
+    );
+    const paramsToSign = { folder, timestamp };
+    const signature = cloudinary.utils.api_sign_request(
+      paramsToSign,
+      process.env.CLOUDINARY_API_SECRET,
+    );
+    res.json({
+      signature,
+      timestamp,
+      folder,
+      cloudName: process.env.CLOUDINARY_CLOUD_NAME,
+      apiKey: process.env.CLOUDINARY_API_KEY,
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to generate upload signature" });
+  }
+});
+
+// Image/Video upload (admin-only) — stored on the backend's local disk under
+// public/uploads and served from ${PUBLIC_UPLOAD_BASE}/uploads. Images are
+// optimized to webp with sharp; videos are stored as-is.
+// Wrap multer so its errors (notably "File too large" past the fileSize limit)
+// come back as a clear JSON message instead of bubbling to Express's default
+// handler, which aborts the connection and shows the browser only "Failed to
+// fetch".
+const uploadSingle = (req, res, next) =>
+  upload.single("file")(req, res, (err) => {
+    if (!err) return next();
+    const mb = Math.round((upload.limits?.fileSize || 0) / 1024 / 1024);
+    const msg =
+      err.code === "LIMIT_FILE_SIZE"
+        ? `The file is larger than the maximum limit (${mb}MB). Please upload a smaller file.`
+        : err.message || "File upload failed";
+    return res.status(413).json({ error: msg });
+  });
+
+router.post(
+  "/upload",
+  requireAdmin,
+  uploadSingle,
+  async (req, res) => {
+    try {
+      if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+
+      const folder =
+        req.body.folder ||
+        req.query.folder ||
+        `${process.env.CLOUDINARY_FOLDER || "applebd"}/media`;
+
+      const asset = await saveLocalUpload({
+        buffer: req.file.buffer,
+        mimetype: req.file.mimetype,
+        originalName: req.file.originalname,
+        folder,
+        baseUrl: requestUploadBase(req),
+      });
+
+      res.json({ ok: true, asset });
+    } catch (err) {
+      // sharp throws on unreadable/unsupported images
+      res.status(400).json({
+        error: err.message || "Invalid image file or unsupported format.",
+      });
+    }
+  },
+);
+
+// Category routes moved to `routes/category.js`
+router.use("/categories", categoryRoutes);
+
+// Public: top-banner + adsense config (no auth — used by frontend)
+router.get("/top-banner", async (req, res) => {
+  try {
+    const SettingModel = (await import("../models/Setting.js")).default;
+    const s = await SettingModel.findOne().lean();
+    res.json({
+      enabled: s?.topBannerEnabled || false,
+      html: s?.topBannerEnabled ? s.topBannerHtml || "" : "",
+      config: s?.topBannerEnabled ? s.topBannerConfig || {} : {},
+      adsenseEnabled: s?.adsenseEnabled || false,
+      adsensePublisherId: s?.adsensePublisherId || "",
+      adsenseSlot: s?.adsenseSlot || "",
+      websiteLogo: s?.websiteLogo || {},
+      footerLogo: s?.footerLogo || {},
+      websiteFavicon: s?.websiteFavicon || {},
+      storeName: s?.storeName || "",
+      footerInfo: s?.footerInfo || { phone: "", email: "", address: "" },
+      contactInfo: s?.contactInfo || { phone: "", email: "", address: "" },
+      megaMenuTags: Array.isArray(s?.megaMenuTags) ? s.megaMenuTags : [],
+      socialLinks: s?.socialLinks || {},
+      policyContent: s?.policyContent || {
+        shipping: [],
+        return: [],
+        faq: [],
+        privacy: [],
+        terms: [],
+      },
+      footerLinks: {
+        quickLinks: Array.isArray(s?.footerLinks?.quickLinks) ? s.footerLinks.quickLinks : [],
+        customerService: Array.isArray(s?.footerLinks?.customerService) ? s.footerLinks.customerService : [],
+      },
+      footerColumns: Array.isArray(s?.footerColumns) ? s.footerColumns : [],
+      footerBrand: s?.footerBrand || {},
+      aboutContent: s?.aboutContent || { hero: {}, features: [], stats: [] },
+      whyChooseUs: s?.whyChooseUs || {
+        enabled: true,
+        title: "",
+        titleBn: "",
+        description: "",
+        descriptionBn: "",
+        image: { url: "", public_id: "" },
+        buttonLabel: "",
+        buttonLink: "/about",
+        items: [],
+      },
+    });
+  } catch (err) {
+    res.json({
+      enabled: false,
+      html: "",
+      config: {},
+      adsenseEnabled: false,
+      adsensePublisherId: "",
+      websiteLogo: {},
+      footerLogo: {},
+      websiteFavicon: {},
+      storeName: "",
+      footerInfo: { phone: "", email: "", address: "" },
+      contactInfo: { phone: "", email: "", address: "" },
+      megaMenuTags: [],
+      socialLinks: {},
+      policyContent: {
+        shipping: [],
+        return: [],
+        faq: [],
+        privacy: [],
+        terms: [],
+      },
+      footerLinks: { quickLinks: [], customerService: [] },
+      footerColumns: [],
+      footerBrand: {},
+      aboutContent: { hero: {}, features: [], stats: [] },
+      whyChooseUs: {
+        enabled: true,
+        title: "",
+        titleBn: "",
+        description: "",
+        descriptionBn: "",
+        image: { url: "", public_id: "" },
+        buttonLabel: "",
+        buttonLink: "/about",
+        items: [],
+      },
+    });
+  }
+});
+
+// Public: tracking pixel configs (no auth — loaded by storefront layout)
+router.get("/tracking-config", async (req, res) => {
+  try {
+    const SettingModel = (await import("../models/Setting.js")).default;
+    const s = await SettingModel.findOne().lean();
+    res.json({
+      facebookPixel:
+        s?.facebookPixel?.active && s?.facebookPixel?.installed
+          ? {
+              pixelId: s.facebookPixel.pixelId,
+              browserSideTracking: s.facebookPixel.browserSideTracking,
+            }
+          : null,
+      googleTagManager:
+        s?.googleTagManager?.active && s?.googleTagManager?.installed
+          ? { containerId: s.googleTagManager.containerId }
+          : null,
+      googleAnalytics4:
+        s?.googleAnalytics4?.active && s?.googleAnalytics4?.installed
+          ? { measurementId: s.googleAnalytics4.measurementId }
+          : null,
+      tiktokPixel:
+        s?.tiktokPixel?.active && s?.tiktokPixel?.installed
+          ? { pixelId: s.tiktokPixel.pixelId }
+          : null,
+      googleAdsense:
+        s?.googleAdsense?.active && s?.googleAdsense?.installed
+          ? {
+              publisherId: s.googleAdsense.publisherId,
+              adSlotId: s.googleAdsense.adSlotId || "",
+              autoAds: s.googleAdsense.autoAds,
+              pageSettings: s.googleAdsense.pageSettings || {},
+            }
+          : null,
+    });
+  } catch (err) {
+    res.json({
+      facebookPixel: null,
+      googleTagManager: null,
+      googleAnalytics4: null,
+      tiktokPixel: null,
+      googleAdsense: null,
+    });
+  }
+});
+
+router.get("/custom-code", async (req, res) => {
+  try {
+    const SettingModel = (await import("../models/Setting.js")).default;
+    const s = await SettingModel.findOne().lean();
+    const cc = s?.customCode;
+    if (!cc?.active) return res.json({ headerCode: "", bodyCode: "", footerCode: "" });
+    res.json({
+      headerCode: cc.headerCode || "",
+      bodyCode: cc.bodyCode || "",
+      footerCode: cc.footerCode || "",
+    });
+  } catch {
+    res.json({ headerCode: "", bodyCode: "", footerCode: "" });
+  }
+});
+
+// Settings (admin area)
+router.get("/settings", requireAdmin, async (req, res) => {
+  try {
+    // allow moderators to view settings; only admins may update (enforced on PUT)
+    const Setting = (await import("../models/Setting.js")).default;
+    let settings = await Setting.findOne();
+    if (!settings) {
+      settings = new Setting();
+      await settings.save();
+    }
+    res.json({ settings });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+router.put("/settings", requireAdmin, async (req, res) => {
+  try {
+    if (req.admin.role !== "admin")
+      return res.status(403).json({ error: "Admin access required" });
+    const payload = req.body || {};
+    const Setting = (await import("../models/Setting.js")).default;
+    const settings = await Setting.findOneAndUpdate(
+      {},
+      { $set: payload },
+      { upsert: true, new: true },
+    );
+    res.json({ ok: true, settings });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Storefront Design settings — the subset of Setting fields edited from the
+// dashboard's "Storefront Design" section. These live on the single Setting
+// document, so they can't go through the generic /settings PUT (which is
+// admin-only to protect store info, pixels, etc.). Each field here is gated by
+// the SAME permission as the page that edits it, so a moderator granted that
+// Storefront Design section can save it, while other Setting fields stay
+// admin-only. Admins pass every check (hasPermission → true for role "admin").
+const STOREFRONT_SETTING_PERMISSIONS = {
+  promoBanner: ["content"], // Promo banner
+  typographicHero: ["content"], // Typographic hero
+  featuredShowcase: ["content"], // Featured showcase
+  categoryShowcase: ["content"], // Category showcase
+  whyChooseUs: ["content"], // Why choose us
+  dealOfDayProductId: ["content"], // Deal of the Day
+  offersTitle: ["content", "catalog"], // Offers section title, edited on Discounts page (Storefront or products/catalog)
+};
+
+router.put("/settings/storefront", requireAdmin, async (req, res) => {
+  try {
+    const payload = req.body || {};
+    const $set = {};
+    for (const [field, permKeys] of Object.entries(
+      STOREFRONT_SETTING_PERMISSIONS,
+    )) {
+      if (!Object.prototype.hasOwnProperty.call(payload, field)) continue;
+      if (!permKeys.some((k) => hasPermission(req.admin, k)))
+        return res
+          .status(403)
+          .json({ error: "You do not have permission to edit this section" });
+      // dealOfDayProductId is an id or null (null clears the Deal of the Day);
+      // accept it whenever the key is present. Other fields are objects.
+      if (field === "dealOfDayProductId") {
+        $set[field] = payload[field] || null;
+      } else if (payload[field] && typeof payload[field] === "object") {
+        $set[field] = payload[field];
+      }
+    }
+    if (Object.keys($set).length === 0)
+      return res.status(400).json({ error: "No valid fields provided" });
+    const Setting = (await import("../models/Setting.js")).default;
+    const settings = await Setting.findOneAndUpdate(
+      {},
+      { $set },
+      { upsert: true, new: true },
+    );
+    res.json({ ok: true, settings });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Delivery charge config (inside/outside Dhaka defaults + per-zone/area
+// overrides) — any authenticated moderator/admin with catalog access can
+// manage, same access model as the policy content route below.
+router.put("/settings/delivery-charge", requireAdmin, async (req, res) => {
+  try {
+    const { deliveryCharge } = req.body || {};
+    if (!deliveryCharge || typeof deliveryCharge !== "object")
+      return res.status(400).json({ error: "deliveryCharge is required" });
+    const Setting = (await import("../models/Setting.js")).default;
+    const settings = await Setting.findOneAndUpdate(
+      {},
+      { $set: { deliveryCharge } },
+      { upsert: true, new: true },
+    );
+    res.json({ ok: true, settings });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Policy pages content — any authenticated moderator/admin can manage.
+// Accepts any combination of these keys so the dashboard's Policy Pages
+// editor can save footer/contact/about tabs through the same route.
+router.put("/settings/policy", requireAdmin, async (req, res) => {
+  try {
+    const { policyContent, footerInfo, contactInfo, socialLinks, footerLinks, footerColumns, footerBrand, footerLogo, aboutContent } =
+      req.body || {};
+    const $set = {};
+    if (policyContent && typeof policyContent === "object")
+      $set.policyContent = policyContent;
+    if (footerInfo && typeof footerInfo === "object") $set.footerInfo = footerInfo;
+    if (contactInfo && typeof contactInfo === "object") $set.contactInfo = contactInfo;
+    if (socialLinks && typeof socialLinks === "object") $set.socialLinks = socialLinks;
+    if (footerLinks && typeof footerLinks === "object") $set.footerLinks = footerLinks;
+    if (Array.isArray(footerColumns)) $set.footerColumns = footerColumns;
+    if (footerBrand && typeof footerBrand === "object") $set.footerBrand = footerBrand;
+    if (footerLogo && typeof footerLogo === "object") $set.footerLogo = footerLogo;
+    if (aboutContent && typeof aboutContent === "object") $set.aboutContent = aboutContent;
+    if (Object.keys($set).length === 0)
+      return res.status(400).json({ error: "No valid fields provided" });
+    const Setting = (await import("../models/Setting.js")).default;
+    const settings = await Setting.findOneAndUpdate(
+      {},
+      { $set },
+      { upsert: true, new: true },
+    );
+    res.json({ ok: true, settings });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Badge options — moderators with catalog permission can manage
+router.put(
+  "/settings/badges",
+  requireAdmin,
+  requirePermission("catalog"),
+  async (req, res) => {
+    try {
+      const { productBadgeOptions } = req.body || {};
+      if (!Array.isArray(productBadgeOptions))
+        return res
+          .status(400)
+          .json({ error: "productBadgeOptions must be an array" });
+      const Setting = (await import("../models/Setting.js")).default;
+      const settings = await Setting.findOneAndUpdate(
+        {},
+        { $set: { productBadgeOptions } },
+        { upsert: true, new: true },
+      );
+      res.json({ ok: true, settings });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// ─── Profit Margin ───────────────────────────────────────────────────────────
+
+router.get(
+  "/profit-margin",
+  requireAdmin,
+  requirePermission("reports.profit"),
+  async (req, res) => {
+  try {
+    const {
+      q,
+      filter = "all",
+      sort = "margin_asc",
+      page = 1,
+      limit = 50,
+    } = req.query;
+    const skip = (Math.max(1, Number(page)) - 1) * Number(limit);
+
+    const dbFilter = { status: { $ne: "archived" } };
+    if (q) {
+      const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      dbFilter.$or = [{ title: re }, { sku: re }];
+    }
+
+    const products = await Product.find(dbFilter)
+      .select(
+        "title sku images variants price buyingPrice deliveryCharge packagingCost category status",
+      )
+      .lean();
+
+    // Aggregate sold units + revenue per product from delivered orders only
+    const soldAgg = await Order.aggregate([
+      { $match: { status: "delivered" } },
+      { $unwind: "$items" },
+      {
+        $group: {
+          _id: "$items.productId",
+          unitsSold: { $sum: "$items.quantity" },
+          soldRevenue: {
+            $sum: { $multiply: ["$items.price", "$items.quantity"] },
+          },
+        },
+      },
+    ]);
+    const soldMap = {};
+    soldAgg.forEach((s) => {
+      if (s._id) soldMap[s._id] = s;
+    });
+
+    const calcMargin = (sellingPrice, buyingPrice) => {
+      const sp = Number(sellingPrice) || 0;
+      const bp = Number(buyingPrice) || 0;
+      if (!sp) return null;
+      if (!bp)
+        return {
+          sp,
+          bp: 0,
+          profit: null,
+          marginPct: null,
+          markupPct: null,
+          hasData: false,
+        };
+      const profit = sp - bp;
+      const marginPct = (profit / sp) * 100;
+      const markupPct = bp > 0 ? (profit / bp) * 100 : null;
+      return { sp, bp, profit, marginPct, markupPct, hasData: true };
+    };
+
+    // Delivery charge + packaging cost are per-product (shared across
+    // variants), so "cost per item" = buying price + delivery + packaging.
+    const extraCost = (p) =>
+      Number(p.deliveryCharge || 0) + Number(p.packagingCost || 0);
+    const costPerItem = (bp, p) =>
+      bp == null ? bp : Number(bp) + extraCost(p);
+
+    const rows = products.map((p) => {
+      const hasVariants = p.variants && p.variants.length > 0;
+      let variantMargins = [];
+      let aggregateMargin = null;
+
+      if (hasVariants) {
+        variantMargins = p.variants.map((v, i) => ({
+          index: i,
+          name:
+            [v.color?.name, v.size].filter(Boolean).join(" / ") ||
+            v.name ||
+            `Variant ${i + 1}`,
+          ...calcMargin(
+            v.price || p.price,
+            costPerItem(v.buyingPrice ?? p.buyingPrice, p),
+          ),
+        }));
+        const validVariants = variantMargins.filter((v) => v.hasData);
+        if (validVariants.length) {
+          const avgMarginPct =
+            validVariants.reduce((s, v) => s + v.marginPct, 0) /
+            validVariants.length;
+          const totalProfit = validVariants.reduce(
+            (s, v) => s + (v.profit || 0),
+            0,
+          );
+          aggregateMargin = {
+            marginPct: avgMarginPct,
+            profit: totalProfit,
+            hasData: true,
+          };
+        } else {
+          const anyHasSp = variantMargins.some((v) => v.sp > 0);
+          aggregateMargin = { hasData: false, noBuyingPrice: anyHasSp };
+        }
+      } else {
+        aggregateMargin = calcMargin(p.price, costPerItem(p.buyingPrice, p));
+      }
+
+      const marginPct = aggregateMargin?.marginPct ?? null;
+      const profitStatus = !aggregateMargin?.hasData
+        ? "no_data"
+        : marginPct < 0
+          ? "loss"
+          : marginPct === 0
+            ? "breakeven"
+            : marginPct < 15
+              ? "low"
+              : marginPct < 30
+                ? "medium"
+                : "high";
+
+      // Per-product sold financials (COGS estimated from current cost per item)
+      const sold = soldMap[p._id.toString()] || {};
+      const effBP =
+        (hasVariants && p.variants?.length
+          ? p.variants.reduce(
+              (s, v) => s + Number(v.buyingPrice ?? p.buyingPrice ?? 0),
+              0,
+            ) / p.variants.length
+          : Number(p.buyingPrice ?? 0)) + extraCost(p);
+      const unitsSold = sold.unitsSold || 0;
+      const soldRevenue = Math.round(sold.soldRevenue || 0);
+      const soldCOGS = Math.round(effBP * unitsSold);
+      const soldProfit = soldRevenue - soldCOGS;
+
+      return {
+        ...p,
+        hasVariants,
+        variantMargins,
+        aggregateMargin,
+        marginPct,
+        profitStatus,
+        unitsSold,
+        soldRevenue,
+        soldCOGS,
+        soldProfit,
+      };
+    });
+
+    let filtered = rows;
+    if (filter === "no_buying_price")
+      filtered = rows.filter((r) => !r.aggregateMargin?.hasData);
+    else if (filter === "loss")
+      filtered = rows.filter((r) => r.profitStatus === "loss");
+    else if (filter === "low")
+      filtered = rows.filter((r) => r.profitStatus === "low");
+    else if (filter === "healthy")
+      filtered = rows.filter((r) =>
+        ["medium", "high"].includes(r.profitStatus),
+      );
+
+    filtered.sort((a, b) => {
+      const am = a.marginPct ?? -Infinity;
+      const bm = b.marginPct ?? -Infinity;
+      if (sort === "margin_asc") return am - bm;
+      if (sort === "margin_desc") return bm - am;
+      if (sort === "profit_desc")
+        return (
+          (b.aggregateMargin?.profit ?? -Infinity) -
+          (a.aggregateMargin?.profit ?? -Infinity)
+        );
+      if (sort === "name_asc") return a.title.localeCompare(b.title);
+      return 0;
+    });
+
+    const totalSoldRevenue = Math.round(
+      rows.reduce((s, r) => s + (r.soldRevenue || 0), 0),
+    );
+    const totalSoldCOGS = Math.round(
+      rows.reduce((s, r) => s + (r.soldCOGS || 0), 0),
+    );
+    const totalSoldProfit = totalSoldRevenue - totalSoldCOGS;
+
+    const summary = {
+      total: rows.length,
+      no_data: rows.filter((r) => r.profitStatus === "no_data").length,
+      loss: rows.filter((r) => r.profitStatus === "loss").length,
+      low: rows.filter((r) => r.profitStatus === "low").length,
+      medium: rows.filter((r) => r.profitStatus === "medium").length,
+      high: rows.filter((r) => r.profitStatus === "high").length,
+      avgMarginPct: (() => {
+        const valid = rows.filter((r) => r.marginPct != null);
+        return valid.length
+          ? valid.reduce((s, r) => s + r.marginPct, 0) / valid.length
+          : null;
+      })(),
+      totalSoldRevenue,
+      totalSoldCOGS,
+      totalSoldProfit,
+      netMarginPct:
+        totalSoldRevenue > 0
+          ? Math.round((totalSoldProfit / totalSoldRevenue) * 1000) / 10
+          : null,
+    };
+
+    const total = filtered.length;
+    res.json({
+      items: filtered.slice(skip, skip + Number(limit)),
+      total,
+      pages: Math.ceil(total / Number(limit)),
+      summary,
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// ─── Profit Margin Analytics (monthly/yearly charts) ─────────────────────────
+
+router.get(
+  "/profit-margin/analytics",
+  requireAdmin,
+  requirePermission("reports.profit"),
+  async (req, res) => {
+  try {
+    // Last 24 months
+    const fromDate = new Date();
+    fromDate.setMonth(fromDate.getMonth() - 23);
+    fromDate.setDate(1);
+    fromDate.setHours(0, 0, 0, 0);
+
+    const itemAgg = await Order.aggregate([
+      {
+        $match: {
+          status: "delivered",
+          createdAt: { $gte: fromDate },
+        },
+      },
+      { $unwind: "$items" },
+      {
+        $group: {
+          _id: {
+            year: { $year: "$createdAt" },
+            month: { $month: "$createdAt" },
+            productId: "$items.productId",
+          },
+          revenue: { $sum: { $multiply: ["$items.price", "$items.quantity"] } },
+          units: { $sum: "$items.quantity" },
+        },
+      },
+    ]);
+
+    if (!itemAgg.length) {
+      return res.json({
+        monthly: [],
+        yearly: [],
+        totals: { revenue: 0, cogs: 0, profit: 0, marginPct: null, units: 0 },
+      });
+    }
+
+    const productIds = [
+      ...new Set(itemAgg.map((r) => r._id.productId).filter(Boolean)),
+    ];
+    const bpProducts = await Product.find({ _id: { $in: productIds } })
+      .select("_id buyingPrice deliveryCharge packagingCost variants")
+      .lean();
+
+    const bpMap = {};
+    bpProducts.forEach((p) => {
+      const pid = p._id.toString();
+      const extra = Number(p.deliveryCharge || 0) + Number(p.packagingCost || 0);
+      if (p.buyingPrice) {
+        bpMap[pid] = Number(p.buyingPrice) + extra;
+      } else if (p.variants?.length) {
+        const valid = p.variants.filter((v) => v.buyingPrice);
+        if (valid.length)
+          bpMap[pid] =
+            valid.reduce((s, v) => s + Number(v.buyingPrice), 0) / valid.length +
+            extra;
+      }
+    });
+
+    const periodMap = {};
+    itemAgg.forEach((row) => {
+      const key = `${row._id.year}-${String(row._id.month).padStart(2, "0")}`;
+      if (!periodMap[key])
+        periodMap[key] = {
+          year: row._id.year,
+          month: row._id.month,
+          revenue: 0,
+          cogs: 0,
+          units: 0,
+        };
+      const bp = bpMap[row._id.productId] || 0;
+      periodMap[key].revenue += row.revenue;
+      periodMap[key].cogs += bp * row.units;
+      periodMap[key].units += row.units;
+    });
+
+    const monthly = Object.entries(periodMap)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([, d]) => {
+        const profit = d.revenue - d.cogs;
+        const hasCogs = d.cogs > 0;
+        return {
+          label: new Date(d.year, d.month - 1).toLocaleDateString("en-US", {
+            month: "short",
+            year: "2-digit",
+          }),
+          year: d.year,
+          month: d.month,
+          revenue: Math.round(d.revenue),
+          cogs: Math.round(d.cogs),
+          profit: Math.round(profit),
+          marginPct:
+            hasCogs && d.revenue > 0
+              ? Math.round((profit / d.revenue) * 1000) / 10
+              : null,
+          units: d.units,
+        };
+      });
+
+    const yearlyMap = {};
+    monthly.forEach((m) => {
+      const y = String(m.year);
+      if (!yearlyMap[y])
+        yearlyMap[y] = { revenue: 0, cogs: 0, profit: 0, units: 0 };
+      yearlyMap[y].revenue += m.revenue;
+      yearlyMap[y].cogs += m.cogs;
+      yearlyMap[y].profit += m.profit;
+      yearlyMap[y].units += m.units;
+    });
+
+    const yearly = Object.entries(yearlyMap)
+      .sort()
+      .map(([year, d]) => ({
+        label: year,
+        year: parseInt(year),
+        ...d,
+        marginPct:
+          d.cogs > 0 && d.revenue > 0
+            ? Math.round((d.profit / d.revenue) * 1000) / 10
+            : null,
+      }));
+
+    const totals = monthly.reduce(
+      (acc, m) => ({
+        revenue: acc.revenue + m.revenue,
+        cogs: acc.cogs + m.cogs,
+        profit: acc.profit + m.profit,
+        units: acc.units + m.units,
+      }),
+      { revenue: 0, cogs: 0, profit: 0, units: 0 },
+    );
+    totals.marginPct =
+      totals.revenue > 0
+        ? Math.round((totals.profit / totals.revenue) * 1000) / 10
+        : null;
+
+    res.json({ monthly, yearly, totals });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// ─── Inventory Management ────────────────────────────────────────────────────
+
+router.get("/inventory", requireAdmin, async (req, res) => {
+  try {
+    const {
+      q,
+      stockFilter,
+      sort = "stock_asc",
+      page = 1,
+      limit = 50,
+    } = req.query;
+    const skip = (Math.max(1, Number(page)) - 1) * Number(limit);
+
+    const filter = { status: { $ne: "archived" } };
+    if (q) {
+      const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+      filter.$or = [{ title: re }, { sku: re }];
+    }
+
+    const allProducts = await Product.find(filter)
+      .select(
+        "title sku images variants inventory availability allowOverselling lowStockThreshold trackInventory updatedAt category status",
+      )
+      .lean();
+
+    const rows = allProducts.map((p) => {
+      const hasVariants = p.variants && p.variants.length > 0;
+      const totalStock = hasVariants
+        ? p.variants.reduce((s, v) => s + (Number(v.inventory) || 0), 0)
+        : Number(p.inventory) || 0;
+      const threshold = p.lowStockThreshold ?? 5;
+      const stockStatus =
+        totalStock <= 0
+          ? "out_of_stock"
+          : totalStock <= threshold
+            ? "low_stock"
+            : "in_stock";
+      return { ...p, totalStock, hasVariants, stockStatus };
+    });
+
+    let filtered = rows;
+    if (stockFilter === "out_of_stock")
+      filtered = rows.filter((r) => r.totalStock <= 0);
+    else if (stockFilter === "low_stock")
+      filtered = rows.filter(
+        (r) => r.totalStock > 0 && r.stockStatus === "low_stock",
+      );
+    else if (stockFilter === "in_stock")
+      filtered = rows.filter((r) => r.totalStock > 0);
+
+    filtered.sort((a, b) => {
+      if (sort === "stock_asc") return a.totalStock - b.totalStock;
+      if (sort === "stock_desc") return b.totalStock - a.totalStock;
+      if (sort === "name_asc") return a.title.localeCompare(b.title);
+      if (sort === "name_desc") return b.title.localeCompare(a.title);
+      return 0;
+    });
+
+    const total = filtered.length;
+    const items = filtered.slice(skip, skip + Number(limit));
+
+    const summary = {
+      total: rows.length,
+      out_of_stock: rows.filter((r) => r.totalStock <= 0).length,
+      low_stock: rows.filter(
+        (r) => r.totalStock > 0 && r.stockStatus === "low_stock",
+      ).length,
+      in_stock: rows.filter(
+        (r) => r.totalStock > 0 && r.stockStatus === "in_stock",
+      ).length,
+    };
+
+    res.json({
+      items,
+      total,
+      pages: Math.ceil(total / Number(limit)),
+      summary,
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+router.patch("/inventory/bulk", requireAdmin, async (req, res) => {
+  try {
+    const { updates } = req.body;
+    if (!Array.isArray(updates))
+      return res.status(400).json({ error: "updates must be array" });
+    const results = await Promise.all(
+      updates.map(async ({ id, inventory, variantIndex }) => {
+        const p = await Product.findById(id);
+        if (!p) return { id, ok: false };
+        if (variantIndex != null && p.variants[variantIndex]) {
+          p.variants[variantIndex].inventory = Math.max(0, Number(inventory));
+        } else {
+          p.inventory = Math.max(0, Number(inventory));
+        }
+        await p.save();
+        clearProductCache(id);
+        return { id, ok: true };
+      }),
+    );
+    clearProductsCache();
+    res.json({ ok: true, results });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+router.patch("/inventory/:id", requireAdmin, async (req, res) => {
+  try {
+    const {
+      variantIndex,
+      inventory,
+      allowOverselling,
+      lowStockThreshold,
+      trackInventory,
+      availability,
+    } = req.body;
+    const product = await Product.findById(req.params.id);
+    if (!product) return res.status(404).json({ error: "Product not found" });
+
+    if (variantIndex != null && product.variants[variantIndex]) {
+      if (inventory != null)
+        product.variants[variantIndex].inventory = Math.max(
+          0,
+          Number(inventory),
+        );
+    } else {
+      if (inventory != null) product.inventory = Math.max(0, Number(inventory));
+    }
+    if (allowOverselling != null)
+      product.allowOverselling = Boolean(allowOverselling);
+    if (lowStockThreshold != null)
+      product.lowStockThreshold = Math.max(0, Number(lowStockThreshold));
+    if (trackInventory != null)
+      product.trackInventory = Boolean(trackInventory);
+    if (availability) product.availability = availability;
+
+    await product.save();
+    clearProductsCache();
+    clearProductCache(req.params.id);
+    const hasVariants = product.variants && product.variants.length > 0;
+    const totalStock = hasVariants
+      ? product.variants.reduce((s, v) => s + (Number(v.inventory) || 0), 0)
+      : Number(product.inventory) || 0;
+    res.json({
+      ok: true,
+      totalStock,
+      product: {
+        _id: product._id,
+        inventory: product.inventory,
+        variants: product.variants,
+        allowOverselling: product.allowOverselling,
+        lowStockThreshold: product.lowStockThreshold,
+        trackInventory: product.trackInventory,
+        availability: product.availability,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Buying price is its own granular permission — moderators without
+// products.buying_price must never receive it (or the other cost-per-item
+// inputs: delivery charge, packaging cost) in any product payload.
+const canSeeBuyingPrice = (admin) =>
+  hasPermission(admin, "products.buying_price");
+
+const stripBuyingPrice = (product) => {
+  if (!product) return product;
+  const p =
+    typeof product.toObject === "function" ? product.toObject() : { ...product };
+  delete p.buyingPrice;
+  delete p.deliveryCharge;
+  delete p.packagingCost;
+  if (Array.isArray(p.variants)) {
+    p.variants = p.variants.map((v) => {
+      const variant =
+        typeof v.toObject === "function" ? v.toObject() : { ...v };
+      delete variant.buyingPrice;
+      return variant;
+    });
+  }
+  return p;
+};
+
+// Admin product management (protected)
+router.get(
+  "/products",
+  requireAdmin,
+  requirePermission("catalog"),
+  async (req, res) => {
+    try {
+      const { page = 1, limit = 20, q, categoryId, status, trashed } = req.query;
+      const skip = (Math.max(1, page) - 1) * limit;
+      const filter = {};
+
+      // Recycle bin: ?trashed=true lists only products currently in the trash;
+      // otherwise trashed products are hidden from the normal dashboard view.
+      const inTrashView = trashed === "true" || trashed === "1";
+      filter.deletedAt = inTrashView ? { $ne: null } : null;
+
+      if (status) {
+        filter.status = status;
+      }
+      // No status param = show all statuses (admin dashboard should see everything)
+
+      if (categoryId) {
+        // accept one id or comma-separated list
+        const ids = String(categoryId)
+          .split(",")
+          .map((id) => id.trim())
+          .filter(Boolean);
+        if (ids.length === 1) filter.categoryId = ids[0];
+        else if (ids.length > 1) filter.categoryId = { $in: ids };
+      }
+      if (q)
+        filter.$or = [
+          { title: new RegExp(q, "i") },
+          { description: new RegExp(q, "i") },
+        ];
+
+      const [items, total] = await Promise.all([
+        Product.find(filter)
+          // in the trash view, order by when items were trashed (newest first)
+          .sort(inTrashView ? { deletedAt: -1 } : { updatedAt: -1 })
+          .skip(Number(skip))
+          .limit(Number(limit)),
+        Product.countDocuments(filter),
+      ]);
+      const safeItems = canSeeBuyingPrice(req.admin)
+        ? items
+        : items.map(stripBuyingPrice);
+      res.json({
+        items: safeItems,
+        total,
+        page: Number(page),
+        limit: Number(limit),
+      });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// Product variation catalog, used by dashboard product forms.
+router.get(
+  "/variations",
+  requireAdmin,
+  requirePermission("catalog"),
+  async (req, res) => {
+    try {
+      const page = Math.max(1, Number(req.query.page) || 1);
+      const perPage = Math.min(
+        50,
+        Math.max(1, Number(req.query.per_page || req.query.limit) || 50),
+      );
+      const skip = (page - 1) * perPage;
+      const [items, total] = await Promise.all([
+        Variation.find({}).sort({ name: 1 }).skip(skip).limit(perPage).lean(),
+        Variation.countDocuments({}),
+      ]);
+      const data = items.map((item) => ({
+        id: item._id,
+        _id: item._id,
+        name: item.name,
+        options: (item.options || []).map((option) => ({
+          id: option._id,
+          _id: option._id,
+          value: option.value,
+        })),
+        created_at: item.created_at,
+        updated_at: item.updated_at,
+      }));
+      res.json({
+        success: true,
+        message: "Variations retrieved successfully",
+        result: {
+          data,
+          meta: {
+            current_page: page,
+            from: total ? skip + 1 : null,
+            last_page: Math.max(1, Math.ceil(total / perPage)),
+            per_page: perPage,
+            to: skip + data.length,
+            total,
+          },
+        },
+      });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+router.post(
+  "/variations",
+  requireAdmin,
+  requirePermission("catalog"),
+  async (req, res) => {
+    try {
+      const name = String(req.body?.name || "").trim();
+      if (!name)
+        return res.status(400).json({ error: "Variation name is required" });
+      const optionValues = Array.isArray(req.body?.options)
+        ? req.body.options.map(normalizeVariationOptionValue).filter(Boolean)
+        : [];
+      const seen = new Set();
+      const options = optionValues
+        .filter((value) => {
+          const key = value.toLowerCase();
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        })
+        .map((value) => ({ value }));
+      const variation = await Variation.create({
+        name,
+        options,
+        createdBy: req.admin._id,
+      });
+      res.json({ ok: true, variation });
+    } catch (err) {
+      if (err?.code === 11000)
+        return res.status(409).json({ error: "Variation already exists" });
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+router.put(
+  "/variations/:id",
+  requireAdmin,
+  requirePermission("catalog"),
+  async (req, res) => {
+    try {
+      const name = String(req.body?.name || "").trim();
+      if (!name)
+        return res.status(400).json({ error: "Variation name is required" });
+      const optionValues = Array.isArray(req.body?.options)
+        ? req.body.options.map(normalizeVariationOptionValue).filter(Boolean)
+        : [];
+      const seen = new Set();
+      const options = optionValues
+        .filter((value) => {
+          const key = value.toLowerCase();
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        })
+        .map((value) => ({ value }));
+      const variation = await Variation.findByIdAndUpdate(
+        req.params.id,
+        { $set: { name, options } },
+        { new: true, runValidators: true },
+      );
+      if (!variation)
+        return res.status(404).json({ error: "Variation not found" });
+      res.json({ ok: true, variation });
+    } catch (err) {
+      if (err?.code === 11000)
+        return res.status(409).json({ error: "Variation already exists" });
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+router.delete(
+  "/variations/:id",
+  requireAdmin,
+  requirePermission("catalog"),
+  async (req, res) => {
+    try {
+      const deleted = await Variation.findByIdAndDelete(req.params.id);
+      if (!deleted)
+        return res.status(404).json({ error: "Variation not found" });
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+const normalizeFaqs = (faqs) => {
+  if (!Array.isArray(faqs)) return faqs;
+  return faqs
+    .filter((f) => f?.question?.trim())
+    .map((f) => {
+      const body = (f.answer || "").trim();
+      const communityAnswers = (f.answers || []).filter((a) => !a.isOfficial);
+      const existingOfficial = (f.answers || []).find((a) => a.isOfficial);
+      // Preserve an admin-chosen question date (shown on the product page).
+      // When omitted or invalid, fall back to "now" so ordering stays sensible.
+      const parsedDate = f.createdAt ? new Date(f.createdAt) : null;
+      const questionDate =
+        parsedDate && !Number.isNaN(parsedDate.getTime())
+          ? parsedDate
+          : new Date();
+      if (!body) {
+        return {
+          question: f.question.trim(),
+          createdAt: questionDate,
+          answers: f.answers || [],
+        };
+      }
+      const officialAnswer = existingOfficial
+        ? { ...existingOfficial, body, createdAt: questionDate }
+        : {
+            body,
+            isOfficial: true,
+            authorName: "Seller",
+            helpful: 0,
+            helpfulBy: [],
+            createdAt: questionDate,
+          };
+      return {
+        question: f.question.trim(),
+        createdAt: questionDate,
+        answers: [officialAnswer, ...communityAnswers],
+      };
+    });
+};
+
+router.post(
+  "/products",
+  requireAdmin,
+  requirePermission("catalog"),
+  async (req, res) => {
+    try {
+      let payload = req.body || {};
+      if (payload.faqs) payload.faqs = normalizeFaqs(payload.faqs);
+      const nextBarcode = normalizeBarcodeCode(payload.barcode);
+
+      // Moderators without the buying-price permission cannot set cost data
+      if (!canSeeBuyingPrice(req.admin)) {
+        delete payload.buyingPrice;
+        delete payload.deliveryCharge;
+        delete payload.packagingCost;
+        if (Array.isArray(payload.variants)) {
+          payload.variants = payload.variants.map(
+            ({ buyingPrice, ...rest }) => rest,
+          );
+        }
+      }
+
+      // ensure drafts and new products are attributed to the current admin
+      if (!payload.createdBy) {
+        payload.createdBy = req.admin._id;
+      }
+
+      // perform a bit of defensive cleanup/validation so the database error is
+      // easier for the client to understand.  This mirrors some of the logic
+      // already in the front end but ensures the server doesn't crash if a bad
+      // payload slips through.
+
+      // make sure each variant has a numeric price; respond with 400 if not.
+      if (Array.isArray(payload.variants)) {
+        for (const v of payload.variants) {
+          if (v.price == null) {
+            return res
+              .status(400)
+              .json({ error: "Each variant must include a price" });
+          }
+          // cast numeric strings to numbers (express.json already does this for
+          // top‑level fields, but nested ones may come through as strings)
+          v.price = Number(v.price);
+          if (v.inventory != null) v.inventory = Number(v.inventory);
+        }
+      }
+
+      if (nextBarcode) {
+        const [duplicateBarcode, duplicateProduct] = await Promise.all([
+          Barcode.findOne({ code: nextBarcode }),
+          Product.findOne({ barcode: nextBarcode }).select("_id title"),
+        ]);
+        if (
+          (duplicateBarcode && duplicateBarcode.product) ||
+          duplicateProduct
+        ) {
+          return res.status(409).json({ error: "Barcode already exists" });
+        }
+        payload.barcode = nextBarcode;
+      } else {
+        delete payload.barcode;
+      }
+
+      // If categoryId provided, resolve and store category name on product for backward compatibility
+      if (payload.categoryId) {
+        try {
+          const Category = (await import("../models/Category.js")).default;
+          const cat = await Category.findById(payload.categoryId);
+          if (cat) payload.category = cat.name;
+        } catch (err) {
+          // ignore resolution errors
+        }
+      }
+
+      const p = new Product(payload);
+      await p.save();
+      clearProductsCache();
+      if (nextBarcode) {
+        try {
+          await syncProductBarcode({
+            productId: p._id,
+            productTitle: p.title,
+            barcode: nextBarcode,
+            createdBy: req.admin._id,
+          });
+        } catch (barcodeErr) {
+          await Product.deleteOne({ _id: p._id });
+          return res
+            .status(barcodeErr.status || 409)
+            .json({ error: barcodeErr.message || "Barcode already exists" });
+        }
+      }
+      await logActivity({
+        entityId: p._id,
+        entityTitle: p.title,
+        action: "create",
+        admin: req.admin,
+      });
+      res.json({
+        ok: true,
+        product: canSeeBuyingPrice(req.admin) ? p : stripBuyingPrice(p),
+      });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+router.get(
+  "/products/:id",
+  requireAdmin,
+  requirePermission("catalog"),
+  async (req, res) => {
+    try {
+      const p = await Product.findById(req.params.id).populate(
+        "frequentlyBoughtTogether",
+        "title price compareAtPrice images slug availability _id",
+      );
+      if (!p) return res.status(404).json({ error: "Not found" });
+      res.json({
+        product: canSeeBuyingPrice(req.admin) ? p : stripBuyingPrice(p),
+      });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// GET /api/admin/products/:id/activity — edit history for one product
+// (who created / edited / trashed / restored it and when)
+router.get(
+  "/products/:id/activity",
+  requireAdmin,
+  requirePermission("catalog"),
+  async (req, res) => {
+    try {
+      if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+        return res.status(400).json({ error: "Invalid product id" });
+      }
+      const items = await ActivityLog.find({
+        entityType: "product",
+        entityId: req.params.id,
+      })
+        .sort({ createdAt: -1 })
+        .limit(200)
+        .lean();
+      res.json({ items });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+router.put(
+  "/products/:id",
+  requireAdmin,
+  requirePermission("catalog"),
+  async (req, res) => {
+    try {
+      const updates = req.body || {};
+      if (updates.faqs) updates.faqs = normalizeFaqs(updates.faqs);
+      const nextBarcode = normalizeBarcodeCode(updates.barcode);
+
+      // variant sanity check (same as POST)
+      if (Array.isArray(updates.variants)) {
+        for (const v of updates.variants) {
+          if (v.price == null) {
+            return res
+              .status(400)
+              .json({ error: "Each variant must include a price" });
+          }
+          v.price = Number(v.price);
+          if (v.inventory != null) v.inventory = Number(v.inventory);
+        }
+      }
+
+      // Load existing product first so barcode ownership can be validated before updating.
+      const existing = await Product.findById(req.params.id);
+      if (!existing) return res.status(404).json({ error: "Not found" });
+
+      // Moderators without the buying-price permission can neither change nor
+      // wipe buying prices or the other cost-per-item inputs — restore the
+      // stored values before applying updates.
+      if (!canSeeBuyingPrice(req.admin)) {
+        delete updates.buyingPrice;
+        delete updates.deliveryCharge;
+        delete updates.packagingCost;
+        if (Array.isArray(updates.variants)) {
+          const existingVariants = existing.variants || [];
+          updates.variants = updates.variants.map((v, i) => {
+            const { buyingPrice, ...rest } = v;
+            const match =
+              (v._id &&
+                existingVariants.find(
+                  (ev) => String(ev._id) === String(v._id),
+                )) ||
+              existingVariants[i];
+            if (match?.buyingPrice != null)
+              rest.buyingPrice = match.buyingPrice;
+            return rest;
+          });
+        }
+      }
+
+      if (nextBarcode) {
+        const [duplicateBarcode, duplicateProduct] = await Promise.all([
+          Barcode.findOne({ code: nextBarcode }),
+          Product.findOne({
+            barcode: nextBarcode,
+            _id: { $ne: existing._id },
+          }).select("_id title"),
+        ]);
+        const barcodeOwnedByOtherProduct =
+          duplicateBarcode &&
+          duplicateBarcode.product &&
+          String(duplicateBarcode.product) !== String(existing._id);
+        if (barcodeOwnedByOtherProduct || duplicateProduct) {
+          return res.status(409).json({ error: "Barcode already exists" });
+        }
+        updates.barcode = nextBarcode;
+      } else {
+        updates.barcode = undefined;
+      }
+
+      // If categoryId present, resolve name
+      if (updates.categoryId) {
+        try {
+          const Category = (await import("../models/Category.js")).default;
+          const cat = await Category.findById(updates.categoryId);
+          if (cat) updates.category = cat.name;
+        } catch (err) {
+          // ignore
+        }
+      }
+
+      // Determine images removed by comparing public_id lists
+      if (Array.isArray(existing.images) && Array.isArray(updates.images)) {
+        const oldIds = existing.images
+          .map((i) => i && i.public_id)
+          .filter(Boolean);
+        const newIds = updates.images
+          .map((i) => i && i.public_id)
+          .filter(Boolean);
+        const removed = oldIds.filter((id) => !newIds.includes(id));
+
+        if (removed.length > 0) {
+          try {
+            ensureCloudinaryConfigured();
+            for (const publicId of removed) {
+              try {
+                // Duplicated products SHARE the same image files (duplicate
+                // references the assets, it does not re-upload them). Only
+                // physically destroy the file if NO other product still points
+                // at this public_id — otherwise the sibling's image 404s.
+                const stillUsed = await Product.exists({
+                  _id: { $ne: req.params.id },
+                  "images.public_id": publicId,
+                });
+                if (stillUsed) continue;
+                await destroyAsset(publicId, {
+                  resource_type: "image",
+                });
+              } catch {
+                // ignore Cloudinary errors
+              }
+            }
+          } catch {
+            // ignore Cloudinary errors
+          }
+        }
+      }
+
+      // Apply updates and return updated product
+      const p = await Product.findByIdAndUpdate(req.params.id, updates, {
+        new: true,
+        runValidators: true,
+      });
+      if (!p) return res.status(404).json({ error: "Not found" });
+      clearProductsCache();
+      clearProductCache(req.params.id);
+      if (nextBarcode) {
+        await syncProductBarcode({
+          productId: p._id,
+          productTitle: p.title,
+          barcode: nextBarcode,
+          createdBy: req.admin._id,
+        });
+        const oldBarcode = normalizeBarcodeCode(existing.barcode);
+        if (oldBarcode && oldBarcode !== nextBarcode) {
+          await Barcode.updateOne(
+            { code: oldBarcode, product: p._id },
+            { $set: { product: null, productTitle: "" } },
+          );
+        }
+      } else {
+        await detachBarcodeFromProduct(p._id);
+      }
+      await logActivity({
+        entityId: p._id,
+        entityTitle: p.title,
+        action: "update",
+        admin: req.admin,
+        meta: {
+          fields: Object.keys(updates).filter(
+            (k) => updates[k] !== undefined,
+          ),
+        },
+      });
+      res.json({
+        ok: true,
+        product: canSeeBuyingPrice(req.admin) ? p : stripBuyingPrice(p),
+      });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+router.delete(
+  "/products/:id",
+  requireAdmin,
+  requirePermission("catalog"),
+  async (req, res) => {
+    try {
+      const force = req.query.force === "true" || req.query.force === "1";
+
+      if (force) {
+        // permanent delete — remove Cloudinary images + barcodes + document
+        const doomed = await Product.findById(req.params.id).select("title");
+        const deleted = await permanentlyDeleteProducts({ _id: req.params.id });
+        if (!deleted) return res.status(404).json({ error: "Not found" });
+        await logActivity({
+          entityId: req.params.id,
+          entityTitle: doomed?.title,
+          action: "permanent-delete",
+          admin: req.admin,
+        });
+        return res.json({ ok: true });
+      }
+
+      // soft-delete: move to trash (recoverable within the retention window)
+      const p = await Product.findByIdAndUpdate(
+        req.params.id,
+        { deletedAt: new Date(), deletedBy: req.admin._id },
+        { new: true },
+      );
+      if (!p) return res.status(404).json({ error: "Not found" });
+      await detachBarcodeFromProduct(p._id);
+      clearProductsCache();
+      clearProductCache(p._id);
+      await logActivity({
+        entityId: p._id,
+        entityTitle: p.title,
+        action: "trash",
+        admin: req.admin,
+      });
+      res.json({ ok: true, product: p });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// --- Recycle bin (bulk) ---------------------------------------------------
+// Parse and validate a `{ ids: [...] }` body into a clean array of ObjectIds.
+const parseProductIds = (body) => {
+  const raw = Array.isArray(body?.ids) ? body.ids : [];
+  return raw
+    .map((id) => String(id || "").trim())
+    .filter((id) => mongoose.Types.ObjectId.isValid(id));
+};
+
+// POST /api/admin/products/trash — bulk move products to the trash
+router.post(
+  "/products/trash",
+  requireAdmin,
+  requirePermission("catalog"),
+  async (req, res) => {
+    try {
+      const ids = parseProductIds(req.body);
+      if (ids.length === 0)
+        return res.status(400).json({ error: "No valid product ids provided" });
+
+      // snapshot titles of the products actually being trashed (still live)
+      const trashing = await Product.find({
+        _id: { $in: ids },
+        deletedAt: null,
+      }).select("_id title");
+
+      const result = await Product.updateMany(
+        { _id: { $in: ids }, deletedAt: null },
+        { $set: { deletedAt: new Date(), deletedBy: req.admin._id } },
+      );
+      await logActivityBulk({
+        items: trashing.map((p) => ({
+          entityId: p._id,
+          entityTitle: p.title,
+        })),
+        action: "trash",
+        admin: req.admin,
+      });
+      // free up any barcodes so trashed products don't hold codes hostage
+      await Barcode.updateMany(
+        { product: { $in: ids } },
+        { $set: { product: null, productTitle: "" } },
+      );
+      await Product.updateMany(
+        { _id: { $in: ids } },
+        { $unset: { barcode: "" } },
+      );
+      clearProductsCache();
+      ids.forEach((id) => clearProductCache(id));
+      res.json({ ok: true, trashed: result.modifiedCount });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// POST /api/admin/products/restore — bulk restore products from the trash
+router.post(
+  "/products/restore",
+  requireAdmin,
+  requirePermission("catalog"),
+  async (req, res) => {
+    try {
+      const ids = parseProductIds(req.body);
+      if (ids.length === 0)
+        return res.status(400).json({ error: "No valid product ids provided" });
+
+      // snapshot titles of the products actually being restored (still trashed)
+      const restoring = await Product.find({
+        _id: { $in: ids },
+        deletedAt: { $ne: null },
+      }).select("_id title");
+
+      const result = await Product.updateMany(
+        { _id: { $in: ids }, deletedAt: { $ne: null } },
+        { $set: { deletedAt: null }, $unset: { deletedBy: "" } },
+      );
+      await logActivityBulk({
+        items: restoring.map((p) => ({
+          entityId: p._id,
+          entityTitle: p.title,
+        })),
+        action: "restore",
+        admin: req.admin,
+      });
+      clearProductsCache();
+      ids.forEach((id) => clearProductCache(id));
+      res.json({ ok: true, restored: result.modifiedCount });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// POST /api/admin/products/permanent-delete — bulk permanent delete.
+// Restricted to items already in the trash so a stray call can't wipe live
+// products; also removes their Cloudinary images and barcodes.
+router.post(
+  "/products/permanent-delete",
+  requireAdmin,
+  requirePermission("catalog"),
+  async (req, res) => {
+    try {
+      const ids = parseProductIds(req.body);
+      if (ids.length === 0)
+        return res.status(400).json({ error: "No valid product ids provided" });
+
+      // snapshot titles before the documents are removed
+      const doomed = await Product.find({
+        _id: { $in: ids },
+        deletedAt: { $ne: null },
+      }).select("_id title");
+
+      const deleted = await permanentlyDeleteProducts({
+        _id: { $in: ids },
+        deletedAt: { $ne: null },
+      });
+      await logActivityBulk({
+        items: doomed.map((p) => ({
+          entityId: p._id,
+          entityTitle: p.title,
+        })),
+        action: "permanent-delete",
+        admin: req.admin,
+      });
+      res.json({ ok: true, deleted });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// POST /api/admin/products/:id/duplicate — clone a product as a new draft
+// (images/Cloudinary assets are referenced, not re-uploaded; barcode/slug/sku
+// are cleared so the clone never collides with the source product)
+router.post(
+  "/products/:id/duplicate",
+  requireAdmin,
+  requirePermission("catalog"),
+  async (req, res) => {
+    try {
+      const source = await Product.findById(req.params.id).lean();
+      if (!source) return res.status(404).json({ error: "Not found" });
+
+      const clone = { ...source };
+      delete clone._id;
+      delete clone.__v;
+      delete clone.createdAt;
+      delete clone.updatedAt;
+      delete clone.slug;
+      delete clone.barcode;
+      delete clone.sku;
+      delete clone.reviews;
+
+      clone.title = `${source.title} (Copy)`;
+      clone.status = "draft";
+      clone.createdBy = req.admin._id;
+      clone.reviewCount = 0;
+      clone.averageRating = 0;
+      clone.monthlySold = 0;
+
+      // Give the clone its own independent copy of every locally-stored image so
+      // that later deleting an image on either product never touches the other's
+      // files. Cloudinary-hosted (legacy) images stay referenced; their deletion
+      // is already guarded by a sibling-in-use check on the product update route.
+      if (Array.isArray(clone.images)) {
+        clone.images = await Promise.all(
+          clone.images.map(async (img) => {
+            if (!img || !img.public_id) return img;
+            const copied = await copyLocalAsset(img.public_id, {
+              folder: "applebd/products",
+            });
+            return copied ? { ...img, ...copied } : img;
+          }),
+        );
+      }
+
+      if (Array.isArray(clone.variants)) {
+        clone.variants = clone.variants.map(({ _id, ...rest }) => ({
+          ...rest,
+        }));
+      }
+
+      const p = new Product(clone);
+      await p.save();
+
+      // copy FAQ entries from the separate FAQ collection
+      const sourceFaqs = await FAQ.find({ productId: source._id }).lean();
+      if (sourceFaqs.length > 0) {
+        await FAQ.insertMany(
+          sourceFaqs.map(({ _id, createdAt, updatedAt, ...faq }) => ({
+            ...faq,
+            productId: p._id,
+          })),
+        );
+      }
+
+      clearProductsCache();
+      await logActivity({
+        entityId: p._id,
+        entityTitle: p.title,
+        action: "duplicate",
+        admin: req.admin,
+        meta: { sourceId: source._id, sourceTitle: source.title },
+      });
+      res.json({
+        ok: true,
+        product: canSeeBuyingPrice(req.admin) ? p : stripBuyingPrice(p),
+      });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// --- Blog (admin) ---
+
+// List / search blog posts (admin)
+router.get(
+  "/blog",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const { page = 1, limit = 20, q, status } = req.query;
+      const skip = (Math.max(1, page) - 1) * limit;
+      const filter = {};
+      if (status) filter.status = status;
+      if (q)
+        filter.$or = [
+          { title: new RegExp(q, "i") },
+          { excerpt: new RegExp(q, "i") },
+          { content: new RegExp(q, "i") },
+        ];
+
+      const [items, total] = await Promise.all([
+        BlogPost.find(filter)
+          .populate("categories")
+          .sort({ updatedAt: -1 })
+          .skip(Number(skip))
+          .limit(Number(limit)),
+        BlogPost.countDocuments(filter),
+      ]);
+      res.json({ items, total, page: Number(page), limit: Number(limit) });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// Create post
+router.post(
+  "/blog",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const payload = req.body || {};
+      const p = new BlogPost(payload);
+      await p.save();
+      res.json({ ok: true, post: p });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// Get all unique tags from blog posts (must be BEFORE /blog/:id route)
+router.get(
+  "/blog/tags",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const tags = await BlogPost.distinct("tags");
+      res.json({ tags: tags.filter((t) => t).sort() });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// Get single post (admin)
+router.get(
+  "/blog/:id",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const p = await BlogPost.findById(req.params.id).populate("categories");
+      if (!p) return res.status(404).json({ error: "Not found" });
+      res.json({ post: p });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// Update post
+router.put(
+  "/blog/:id",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const updates = req.body || {};
+      if (updates.status === "published")
+        updates.publishedAt = updates.publishedAt || Date.now();
+      const p = await BlogPost.findByIdAndUpdate(req.params.id, updates, {
+        new: true,
+      });
+      if (!p) return res.status(404).json({ error: "Not found" });
+      res.json({ ok: true, post: p });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// Delete / archive post
+router.delete(
+  "/blog/:id",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const p = await BlogPost.findByIdAndUpdate(
+        req.params.id,
+        { status: "archived" },
+        { new: true },
+      );
+      if (!p) return res.status(404).json({ error: "Not found" });
+      res.json({ ok: true, post: p });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// --- Blog Categories (admin) ---
+
+// List all blog categories
+router.get(
+  "/blog-categories",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const categories = await BlogCategory.find().sort({ name: 1 });
+      res.json({ categories });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// Create blog category
+router.post(
+  "/blog-categories",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const { name, description } = req.body;
+      if (!name) return res.status(400).json({ error: "Name is required" });
+
+      const category = new BlogCategory({ name, description });
+      await category.save();
+      res.json({ ok: true, category });
+    } catch (err) {
+      if (err.code === 11000) {
+        return res.status(400).json({ error: "Category name already exists" });
+      }
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// Update blog category
+router.put(
+  "/blog-categories/:id",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const { name, description } = req.body;
+      const updates = {};
+      if (name) updates.name = name;
+      if (description !== undefined) updates.description = description;
+
+      const category = await BlogCategory.findByIdAndUpdate(
+        req.params.id,
+        updates,
+        { new: true },
+      );
+      if (!category)
+        return res.status(404).json({ error: "Category not found" });
+      res.json({ ok: true, category });
+    } catch (err) {
+      if (err.code === 11000) {
+        return res.status(400).json({ error: "Category name already exists" });
+      }
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// Delete blog category
+router.delete(
+  "/blog-categories/:id",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const category = await BlogCategory.findByIdAndDelete(req.params.id);
+      if (!category)
+        return res.status(404).json({ error: "Category not found" });
+
+      // Remove category from all blog posts
+      await BlogPost.updateMany(
+        { categories: req.params.id },
+        { $pull: { categories: req.params.id } },
+      );
+
+      res.json({ ok: true, category });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// Admin login
+router.post("/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password)
+      return res.status(400).json({ error: "Missing fields" });
+
+    const admin = await Admin.findOne({ email: email.toLowerCase() });
+    if (!admin || !admin.hashedPassword) {
+      return res.status(401).json({ error: "Invalid credentials" });
+    }
+
+    // Check if account is active
+    if (!admin.isActive) {
+      return res
+        .status(403)
+        .json({ error: "Account is disabled. Contact super admin." });
+    }
+
+    // Check if account is locked
+    if (admin.isCurrentlyLocked) {
+      const minutesLeft = Math.ceil((admin.lockUntil - Date.now()) / 60000);
+      return res.status(423).json({
+        error: `Account is temporarily locked. Try again in ${minutesLeft} minutes.`,
+      });
+    }
+
+    // Verify password
+    const ok = await bcrypt.compare(password, admin.hashedPassword);
+    if (!ok) {
+      await admin.incLoginAttempts();
+      return res.status(401).json({ error: "Invalid credentials" });
+    }
+
+    // Successful login - reset attempts and update last login info
+    await admin.resetLoginAttempts();
+    admin.lastLoginAt = Date.now();
+    admin.lastLoginIP =
+      req.ip || req.headers["x-forwarded-for"] || req.connection.remoteAddress;
+    await admin.save();
+
+    const token = createToken(admin);
+    // SameSite=none + Secure required for cross-origin cookie (Vercel frontend ↔ Render backend)
+    res.cookie("token", token, {
+      httpOnly: true,
+      sameSite: "none",
+      secure: true,
+    });
+
+    res.json({
+      user: {
+        email: admin.email,
+        name: admin.name,
+        role: admin.role,
+        image: null,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// --- Admin accounts management (admin-only) ---
+
+// List all admins/moderators
+router.get("/admins", requireAdmin, async (req, res) => {
+  try {
+    if (req.admin.role !== "admin")
+      return res.status(403).json({ error: "Admin access required" });
+    // Hidden owner/root accounts never appear in the Authorized-admins list.
+    const items = await Admin.find({ superAdmin: { $ne: true } }).select(
+      "-hashedPassword -resetToken -resetExpires -loginAttempts",
+    );
+    res.json({ items });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Get single admin
+router.get("/admins/:id", requireAdmin, async (req, res) => {
+  try {
+    if (req.admin.role !== "admin")
+      return res.status(403).json({ error: "Admin access required" });
+    const a = await Admin.findById(req.params.id).select(
+      "-hashedPassword -resetToken -resetExpires -loginAttempts",
+    );
+    // A hidden owner account is invisible to everyone but itself.
+    if (!a || (a.superAdmin && !req.admin.superAdmin))
+      return res.status(404).json({ error: "Not found" });
+    res.json({ admin: a });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Create new admin (admin-only)
+router.post("/admins", requireAdmin, async (req, res) => {
+  try {
+    if (req.admin.role !== "admin")
+      return res.status(403).json({ error: "Admin access required" });
+    const { name, email, password, role, permissions } = req.body || {};
+    if (!name || !email || !password)
+      return res.status(400).json({ error: "Missing fields" });
+    const existing = await Admin.findOne({ email: email.toLowerCase() });
+    if (existing)
+      return res
+        .status(400)
+        .json({ error: "Admin with this email already exists" });
+    const hashed = await bcrypt.hash(password, SALT_ROUNDS);
+    const resolvedRole = role === "moderator" ? "moderator" : "admin";
+    const admin = new Admin({
+      name,
+      email: email.toLowerCase(),
+      hashedPassword: hashed,
+      role: resolvedRole,
+      isActive: true,
+      permissions:
+        resolvedRole === "moderator" ? sanitizePermissions(permissions) : [],
+    });
+    await admin.save();
+    res.json({
+      ok: true,
+      admin: {
+        email: admin.email,
+        name: admin.name,
+        role: admin.role,
+        permissions: admin.permissions,
+        _id: admin._id,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Update admin (admin-only)
+router.put("/admins/:id", requireAdmin, async (req, res) => {
+  try {
+    if (req.admin.role !== "admin")
+      return res.status(403).json({ error: "Admin access required" });
+    const { name, email, newPassword, role, isActive, permissions } =
+      req.body || {};
+    const a = await Admin.findById(req.params.id);
+    if (!a || (a.superAdmin && !req.admin.superAdmin))
+      return res.status(404).json({ error: "Not found" });
+
+    if (email && email.toLowerCase() !== a.email) {
+      const exists = await Admin.findOne({ email: email.toLowerCase() });
+      if (exists)
+        return res
+          .status(400)
+          .json({ error: "Another admin already uses that email" });
+      a.email = email.toLowerCase();
+    }
+    if (name) a.name = name;
+    if (typeof isActive === "boolean") a.isActive = isActive;
+    if (role) a.role = role === "moderator" ? "moderator" : "admin";
+    if (newPassword)
+      a.hashedPassword = await bcrypt.hash(newPassword, SALT_ROUNDS);
+    if (typeof permissions !== "undefined") {
+      a.permissions =
+        a.role === "moderator" ? sanitizePermissions(permissions) : [];
+    } else if (a.role === "admin") {
+      a.permissions = [];
+    }
+
+    await a.save();
+    res.json({
+      ok: true,
+      admin: {
+        _id: a._id,
+        name: a.name,
+        email: a.email,
+        role: a.role,
+        isActive: a.isActive,
+        permissions: a.permissions,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Deactivate admin (admin-only)
+router.put("/admins/:id/deactivate", requireAdmin, async (req, res) => {
+  try {
+    if (req.admin.role !== "admin")
+      return res.status(403).json({ error: "Admin access required" });
+    if (req.admin._id.toString() === req.params.id)
+      return res.status(400).json({ error: "Cannot deactivate yourself" });
+    const target = await Admin.findById(req.params.id).select("superAdmin");
+    if (!target || (target.superAdmin && !req.admin.superAdmin))
+      return res.status(404).json({ error: "Not found" });
+    const a = await Admin.findByIdAndUpdate(
+      req.params.id,
+      { isActive: false },
+      { new: true },
+    );
+    if (!a) return res.status(404).json({ error: "Not found" });
+    res.json({ ok: true, admin: { _id: a._id, isActive: a.isActive } });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Delete admin (admin-only)
+router.delete("/admins/:id", requireAdmin, async (req, res) => {
+  try {
+    if (req.admin.role !== "admin")
+      return res.status(403).json({ error: "Admin access required" });
+    if (req.admin._id.toString() === req.params.id)
+      return res.status(400).json({ error: "Cannot delete yourself" });
+    const a = await Admin.findById(req.params.id);
+    if (!a || (a.superAdmin && !req.admin.superAdmin))
+      return res.status(404).json({ error: "Not found" });
+    await Admin.deleteOne({ _id: a._id });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// --- Customer tag management -----------------------------------------
+router.get(
+  "/customer-tags",
+  requireAdmin,
+  requirePermission("customers"),
+  async (req, res) => {
+    try {
+      const items = await CustomerTag.find({}).sort({ name: 1 });
+      res.json({ items });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+router.post(
+  "/customer-tags",
+  requireAdmin,
+  requirePermission("customers"),
+  async (req, res) => {
+    try {
+      const { name, color, description } = req.body || {};
+      if (!name || !String(name).trim()) {
+        return res.status(400).json({ error: "Tag name is required" });
+      }
+      const tag = await CustomerTag.create({
+        name: String(name).trim(),
+        color: color || "#3B82F6",
+        description: description || "",
+      });
+      res.status(201).json({ tag });
+    } catch (err) {
+      res.status(500).json({
+        error: err.code === 11000 ? "Tag already exists" : "Server error",
+      });
+    }
+  },
+);
+
+router.put(
+  "/customer-tags/:id",
+  requireAdmin,
+  requirePermission("customers"),
+  async (req, res) => {
+    try {
+      const { name, color, description } = req.body || {};
+      const tag = await CustomerTag.findById(req.params.id);
+      if (!tag) return res.status(404).json({ error: "Not found" });
+      if (typeof name !== "undefined") tag.name = String(name).trim();
+      if (typeof color !== "undefined") tag.color = color || "#3B82F6";
+      if (typeof description !== "undefined")
+        tag.description = description || "";
+      await tag.save();
+      res.json({ ok: true, tag });
+    } catch (err) {
+      res.status(500).json({
+        error: err.code === 11000 ? "Tag already exists" : "Server error",
+      });
+    }
+  },
+);
+
+router.delete(
+  "/customer-tags/:id",
+  requireAdmin,
+  requirePermission("customers"),
+  async (req, res) => {
+    try {
+      const tag = await CustomerTag.findById(req.params.id);
+      if (!tag) return res.status(404).json({ error: "Not found" });
+      await CustomerTag.deleteOne({ _id: tag._id });
+      await User.updateMany({ tags: tag._id }, { $pull: { tags: tag._id } });
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// --- Packaging cost management -----------------------------------------
+router.get(
+  "/packaging-costs",
+  requireAdmin,
+  requirePermission("products.packaging"),
+  async (req, res) => {
+    try {
+      const items = await PackagingCost.find({}).sort({ name: 1 });
+      res.json({ items });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+router.post(
+  "/packaging-costs",
+  requireAdmin,
+  requirePermission("products.packaging"),
+  async (req, res) => {
+    try {
+      const { name, cost, description } = req.body || {};
+      if (!name || !String(name).trim()) {
+        return res.status(400).json({ error: "Name is required" });
+      }
+      const costNum = Number(cost);
+      if (!Number.isFinite(costNum) || costNum < 0) {
+        return res.status(400).json({ error: "Cost must be a valid number" });
+      }
+      const item = await PackagingCost.create({
+        name: String(name).trim(),
+        cost: costNum,
+        description: description || "",
+      });
+      res.status(201).json({ item });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+router.put(
+  "/packaging-costs/:id",
+  requireAdmin,
+  requirePermission("products.packaging"),
+  async (req, res) => {
+    try {
+      const { name, cost, description } = req.body || {};
+      const item = await PackagingCost.findById(req.params.id);
+      if (!item) return res.status(404).json({ error: "Not found" });
+      if (typeof name !== "undefined") {
+        if (!String(name).trim()) {
+          return res.status(400).json({ error: "Name is required" });
+        }
+        item.name = String(name).trim();
+      }
+      if (typeof cost !== "undefined") {
+        const costNum = Number(cost);
+        if (!Number.isFinite(costNum) || costNum < 0) {
+          return res.status(400).json({ error: "Cost must be a valid number" });
+        }
+        item.cost = costNum;
+      }
+      if (typeof description !== "undefined") item.description = description || "";
+      await item.save();
+      res.json({ ok: true, item });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+router.delete(
+  "/packaging-costs/:id",
+  requireAdmin,
+  requirePermission("products.packaging"),
+  async (req, res) => {
+    try {
+      const item = await PackagingCost.findById(req.params.id);
+      if (!item) return res.status(404).json({ error: "Not found" });
+      await PackagingCost.deleteOne({ _id: item._id });
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// --- Dropshipping cost management (cost to bring a product from the
+// dropshipping supplier to the store — feeds "cost per item" alongside
+// buying price and packaging cost) --------------------------------------
+router.get(
+  "/dropshipping-costs",
+  requireAdmin,
+  requirePermission("products.dropshipping"),
+  async (req, res) => {
+    try {
+      const items = await DropshippingCost.find({}).sort({ name: 1 });
+      res.json({ items });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+router.post(
+  "/dropshipping-costs",
+  requireAdmin,
+  requirePermission("products.dropshipping"),
+  async (req, res) => {
+    try {
+      const { name, cost, description } = req.body || {};
+      if (!name || !String(name).trim()) {
+        return res.status(400).json({ error: "Name is required" });
+      }
+      const costNum = Number(cost);
+      if (!Number.isFinite(costNum) || costNum < 0) {
+        return res.status(400).json({ error: "Cost must be a valid number" });
+      }
+      const item = await DropshippingCost.create({
+        name: String(name).trim(),
+        cost: costNum,
+        description: description || "",
+      });
+      res.status(201).json({ item });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+router.put(
+  "/dropshipping-costs/:id",
+  requireAdmin,
+  requirePermission("products.dropshipping"),
+  async (req, res) => {
+    try {
+      const { name, cost, description } = req.body || {};
+      const item = await DropshippingCost.findById(req.params.id);
+      if (!item) return res.status(404).json({ error: "Not found" });
+      if (typeof name !== "undefined") {
+        if (!String(name).trim()) {
+          return res.status(400).json({ error: "Name is required" });
+        }
+        item.name = String(name).trim();
+      }
+      if (typeof cost !== "undefined") {
+        const costNum = Number(cost);
+        if (!Number.isFinite(costNum) || costNum < 0) {
+          return res.status(400).json({ error: "Cost must be a valid number" });
+        }
+        item.cost = costNum;
+      }
+      if (typeof description !== "undefined") item.description = description || "";
+      await item.save();
+      res.json({ ok: true, item });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+router.delete(
+  "/dropshipping-costs/:id",
+  requireAdmin,
+  requirePermission("products.dropshipping"),
+  async (req, res) => {
+    try {
+      const item = await DropshippingCost.findById(req.params.id);
+      if (!item) return res.status(404).json({ error: "Not found" });
+      await DropshippingCost.deleteOne({ _id: item._id });
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// --- Barcode management ----------------------------------------------
+router.get(
+  "/barcodes",
+  requireAdmin,
+  requirePermission("catalog"),
+  async (req, res) => {
+    try {
+      const { q = "", code = "", limit = 100, page = 1 } = req.query;
+      const filter = {};
+      const exactCode = normalizeBarcodeCode(code);
+      const searchTerm = String(q || "").trim();
+      if (exactCode) {
+        filter.code = exactCode;
+      } else if (searchTerm) {
+        filter.$or = [
+          { code: new RegExp(searchTerm, "i") },
+          { label: new RegExp(searchTerm, "i") },
+          { productTitle: new RegExp(searchTerm, "i") },
+        ];
+      }
+      const skip =
+        (Math.max(1, Number(page)) - 1) * Math.min(500, Number(limit) || 100);
+      const pageSize = Math.min(500, Math.max(1, Number(limit) || 100));
+      const [items, total] = await Promise.all([
+        Barcode.find(filter)
+          .populate("product", "title images barcode sku status")
+          .sort({ updatedAt: -1 })
+          .skip(skip)
+          .limit(pageSize),
+        Barcode.countDocuments(filter),
+      ]);
+      const normalizedItems = items.map((item) => {
+        const linkedBarcode = normalizeBarcodeCode(item.product?.barcode);
+        if (!item.product || linkedBarcode !== item.code) {
+          return { ...item.toObject(), product: null, productTitle: "" };
+        }
+        return item.toObject();
+      });
+      res.json({
+        items: normalizedItems,
+        total,
+        page: Number(page),
+        limit: pageSize,
+      });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+router.post(
+  "/barcodes",
+  requireAdmin,
+  requirePermission("catalog"),
+  async (req, res) => {
+    try {
+      const code = normalizeBarcodeCode(
+        req.body?.code || generateBarcodeCode(),
+      );
+      const label = String(req.body?.label || "").trim();
+      const notes = String(req.body?.notes || "").trim();
+      const productId = req.body?.product || null;
+
+      const [exists, existingProduct] = await Promise.all([
+        Barcode.findOne({ code }),
+        productId
+          ? Product.findById(productId).select("_id title barcode")
+          : Promise.resolve(null),
+      ]);
+      if (exists)
+        return res.status(409).json({ error: "Barcode already exists" });
+      if (productId && !existingProduct)
+        return res.status(404).json({ error: "Linked product not found" });
+      if (
+        productId &&
+        existingProduct?.barcode &&
+        normalizeBarcodeCode(existingProduct.barcode) !== code
+      ) {
+        return res.status(409).json({ error: "Product already has a barcode" });
+      }
+
+      const item = await Barcode.create({
+        code,
+        label,
+        notes,
+        product: productId || null,
+        productTitle: req.body?.productTitle || "",
+        createdBy: req.admin._id,
+        isActive: true,
+      });
+      if (productId) {
+        await Barcode.updateMany(
+          { product: productId, code: { $ne: code } },
+          { $set: { product: null, productTitle: "" } },
+        );
+        await Product.updateOne(
+          { _id: productId },
+          { $set: { barcode: code } },
+        );
+      }
+      res.status(201).json({ ok: true, item });
+    } catch (err) {
+      res.status(500).json({
+        error: err.code === 11000 ? "Barcode already exists" : "Server error",
+      });
+    }
+  },
+);
+
+router.put(
+  "/barcodes/:id",
+  requireAdmin,
+  requirePermission("catalog"),
+  async (req, res) => {
+    try {
+      const item = await Barcode.findById(req.params.id);
+      if (!item) return res.status(404).json({ error: "Not found" });
+
+      const nextCode =
+        req.body?.code !== undefined
+          ? normalizeBarcodeCode(req.body.code)
+          : item.code;
+      if (!nextCode)
+        return res.status(400).json({ error: "Barcode code is required" });
+      const previousCode = item.code;
+      const previousProductId = item.product ? String(item.product) : null;
+
+      if (nextCode !== item.code) {
+        const duplicate = await Barcode.findOne({ code: nextCode });
+        if (duplicate && duplicate._id.toString() !== item._id.toString()) {
+          return res.status(409).json({ error: "Barcode already exists" });
+        }
+        item.code = nextCode;
+      }
+
+      if (req.body?.label !== undefined)
+        item.label = String(req.body.label).trim();
+      if (req.body?.notes !== undefined)
+        item.notes = String(req.body.notes).trim();
+      if (req.body?.product !== undefined) {
+        const nextProductId = req.body.product || null;
+        if (nextProductId && String(nextProductId) !== previousProductId) {
+          const nextProduct =
+            await Product.findById(nextProductId).select("_id title barcode");
+          if (!nextProduct)
+            return res.status(404).json({ error: "Linked product not found" });
+          if (
+            nextProduct.barcode &&
+            normalizeBarcodeCode(nextProduct.barcode) !== nextCode
+          ) {
+            return res
+              .status(409)
+              .json({ error: "Product already has a barcode" });
+          }
+        }
+        item.product = nextProductId;
+      }
+      if (req.body?.productTitle !== undefined)
+        item.productTitle = String(req.body.productTitle || "").trim();
+      if (req.body?.isActive !== undefined) item.isActive = !!req.body.isActive;
+
+      await item.save();
+      if (
+        previousProductId &&
+        previousProductId !== String(item.product || "")
+      ) {
+        await Product.updateOne(
+          { _id: previousProductId, barcode: previousCode },
+          { $unset: { barcode: "" } },
+        );
+      }
+      if (item.product) {
+        await Barcode.updateMany(
+          { product: item.product, code: { $ne: item.code } },
+          { $set: { product: null, productTitle: "" } },
+        );
+        await Product.updateOne(
+          { _id: item.product },
+          { $set: { barcode: item.code } },
+        );
+      }
+      await item.populate("product", "title images barcode sku status");
+      res.json({ ok: true, item });
+    } catch (err) {
+      res.status(500).json({
+        error: err.code === 11000 ? "Barcode already exists" : "Server error",
+      });
+    }
+  },
+);
+
+router.delete(
+  "/barcodes/:id",
+  requireAdmin,
+  requirePermission("catalog"),
+  async (req, res) => {
+    try {
+      const item = await Barcode.findById(req.params.id);
+      if (!item) return res.status(404).json({ error: "Not found" });
+      if (item.product) {
+        await Product.updateOne(
+          { _id: item.product, barcode: item.code },
+          { $unset: { barcode: "" } },
+        );
+      }
+      await Barcode.deleteOne({ _id: item._id });
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// --- User management -------------------------------------------------
+router.get(
+  "/users",
+  requireAdmin,
+  requirePermission("customers"),
+  async (req, res) => {
+    try {
+      const { q = "", limit = 200, includeStats } = req.query;
+      const filter = {};
+      if (q) {
+        filter.$or = [
+          { email: new RegExp(q, "i") },
+          { name: new RegExp(q, "i") },
+          { mobile: new RegExp(q, "i") },
+        ];
+      }
+      const users = await User.find(filter)
+        .select("-hashedPassword -resetToken -resetExpires")
+        .populate("tags")
+        .sort({ createdAt: -1 })
+        .limit(Number(limit))
+        .lean();
+
+      // Newsletter signups from the public storefront (footer/hero) land in the
+      // separate Subscriber collection — they do NOT flip the User's
+      // `newsletterSubscribed` flag. Cross-reference by email so a customer who
+      // subscribed with just their email still shows as "Subscribed" here.
+      const emails = users.map((u) => u.email).filter(Boolean);
+      const subscribedEmails = new Set(
+        (
+          await Subscriber.find({ email: { $in: emails } })
+            .select("email")
+            .lean()
+        ).map((s) => s.email),
+      );
+      users.forEach((u) => {
+        if (u.email && subscribedEmails.has(u.email))
+          u.newsletterSubscribed = true;
+      });
+
+      let items = users;
+      if (includeStats === "1" || includeStats === "true") {
+        items = await Promise.all(
+          users.map(async (user) => {
+            const orders = await Order.find(buildCustomerOrderFilter(user))
+              .select("status shipment.courier")
+              .lean();
+            return {
+              ...user,
+              orderSummary: summarizeOrdersForList(orders),
+            };
+          }),
+        );
+      }
+
+      res.json({ items });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// Get single user
+router.get(
+  "/users/:id",
+  requireAdmin,
+  requirePermission("customers"),
+  async (req, res) => {
+    try {
+      const u = await User.findById(req.params.id)
+        .select("-hashedPassword -resetToken -resetExpires")
+        .populate("tags")
+        .lean();
+      if (!u) return res.status(404).json({ error: "Not found" });
+      // Reflect public-storefront newsletter signups (Subscriber collection),
+      // matching the list endpoint's cross-reference.
+      if (!u.newsletterSubscribed && u.email) {
+        const sub = await Subscriber.exists({ email: u.email });
+        if (sub) u.newsletterSubscribed = true;
+      }
+      res.json({ user: u });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+router.put("/users/:id", requireAdmin, async (req, res) => {
+  try {
+    if (req.admin.role !== "admin")
+      return res.status(403).json({ error: "Admin access required" });
+    const { name, mobile, isVerified, tags } = req.body || {};
+    const u = await User.findById(req.params.id);
+    if (!u) return res.status(404).json({ error: "Not found" });
+
+    // Build order filter using old identifiers BEFORE updating the user
+    const orderFilter = buildCustomerOrderFilter(u);
+
+    if (typeof name !== "undefined") u.name = name;
+    if (typeof mobile !== "undefined") u.mobile = String(mobile || "").trim();
+    if (typeof isVerified !== "undefined") u.isVerified = !!isVerified;
+    if (Array.isArray(tags)) u.tags = tags.filter(Boolean);
+    await u.save();
+    await u.populate("tags");
+
+    // Sync name/mobile changes to all related orders' billingDetails
+    const billingPatch = {};
+    if (typeof name !== "undefined" && String(name || "").trim())
+      billingPatch["billingDetails.name"] = String(name).trim();
+    if (typeof mobile !== "undefined" && String(mobile || "").trim())
+      billingPatch["billingDetails.phone"] = String(mobile).trim();
+    if (Object.keys(billingPatch).length) {
+      await Order.updateMany(orderFilter, { $set: billingPatch });
+    }
+
+    res.json({
+      ok: true,
+      user: {
+        _id: u._id,
+        email: u.email,
+        name: u.name,
+        mobile: u.mobile,
+        provider: u.provider,
+        isVerified: u.isVerified,
+        createdAt: u.createdAt,
+        tags: u.tags,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+router.delete("/users/:id", requireAdmin, async (req, res) => {
+  try {
+    if (req.admin.role !== "admin")
+      return res.status(403).json({ error: "Admin access required" });
+    const u = await User.findById(req.params.id);
+    if (!u) return res.status(404).json({ error: "Not found" });
+    if (u.role === "admin")
+      return res.status(400).json({ error: "Cannot delete admin user" });
+    await User.deleteOne({ _id: u._id });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+function normalizePhone(phone) {
+  return String(phone || "").replace(/\D/g, "");
+}
+
+async function resolveCustomerUserId(order) {
+  if (order.userId) return String(order.userId);
+  const email = order.billingDetails?.email || order.userEmail;
+  if (email) {
+    const u = await User.findOne({ email: String(email).toLowerCase() })
+      .select("_id")
+      .lean();
+    if (u) return String(u._id);
+  }
+  const phone = order.billingDetails?.phone;
+  if (phone) {
+    const u = await User.findOne({ mobile: phone }).select("_id").lean();
+    if (u) return String(u._id);
+  }
+  return null;
+}
+
+function buildCustomerOrderFilter(user) {
+  const or = [{ userId: String(user._id) }];
+  if (user.email) {
+    or.push({ userEmail: user.email });
+    or.push({ "billingDetails.email": user.email });
+  }
+  if (user.mobile) {
+    const last10 = String(user.mobile).replace(/\D/g, "").slice(-10);
+    if (last10.length >= 8) {
+      or.push({ "billingDetails.phone": new RegExp(last10 + "$") });
+    } else {
+      or.push({ "billingDetails.phone": user.mobile });
+    }
+  }
+  return { $or: or };
+}
+
+// GET /api/admin/phones/:phone/lifetime-stats — cross-platform courier fraud check by mobile
+router.get(
+  "/phones/:phone/lifetime-stats",
+  requireAdmin,
+  requirePermission("customers"),
+  async (req, res) => {
+    try {
+      const refresh = req.query.refresh === "1" || req.query.refresh === "true";
+      const lifetime = await fetchLifetimeCourierStats(req.params.phone, {
+        skipCache: refresh,
+      });
+      res.json(lifetime);
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// GET /api/admin/users/:id/profile — customer analytics and order history
+router.get(
+  "/users/:id/profile",
+  requireAdmin,
+  requirePermission("customers"),
+  async (req, res) => {
+    try {
+      const user = await User.findById(req.params.id)
+        .select("-hashedPassword -resetToken -resetExpires")
+        .populate("tags")
+        .lean();
+      if (!user) return res.status(404).json({ error: "Not found" });
+
+      const orders = await Order.find(buildCustomerOrderFilter(user))
+        .sort({ createdAt: -1 })
+        .lean();
+
+      const analytics = computeCustomerAnalytics(orders);
+      const includeLifetime =
+        req.query.lifetime === "1" || req.query.lifetime === "true";
+
+      let lifetime = null;
+      if (includeLifetime && user.mobile) {
+        const refresh =
+          req.query.refresh === "1" || req.query.refresh === "true";
+        lifetime = await fetchLifetimeCourierStats(user.mobile, {
+          skipCache: refresh,
+        });
+      }
+
+      res.json({
+        user,
+        AppleBD: {
+          stats: analytics.stats,
+          percentages: analytics.percentages,
+          courierBreakdown: analytics.courierBreakdown,
+          risk: analytics.risk,
+        },
+        stats: analytics.stats,
+        percentages: analytics.percentages,
+        courierBreakdown: analytics.courierBreakdown,
+        risk: analytics.risk,
+        lifetime,
+        orders: orders.map((order) => ({
+          ...order,
+          orderId: order.orderNumber || formatOrderIdSuffix(order._id),
+        })),
+      });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// Admin forgot password
+router.post("/forgot", async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: "Missing fields" });
+
+    const admin = await Admin.findOne({ email: email.toLowerCase() });
+    if (!admin) {
+      // Don't reveal if admin exists or not
+      return res.json({
+        ok: true,
+        message: "If account exists, reset token has been generated",
+      });
+    }
+
+    const token = crypto.randomBytes(32).toString("hex");
+    admin.resetToken = token;
+    admin.resetExpires = Date.now() + 1000 * 60 * 30; // 30 minutes
+    await admin.save();
+
+    // TODO: send email with link containing token. The token must never be
+    // returned in the response — anyone could take over the account with it.
+    res.json({
+      ok: true,
+      message: "If account exists, reset token has been generated",
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+router.post("/reset", async (req, res) => {
+  try {
+    const { token, newPassword } = req.body;
+    if (!token || !newPassword)
+      return res.status(400).json({ error: "Missing fields" });
+
+    if (newPassword.length < 6) {
+      return res
+        .status(400)
+        .json({ error: "Password must be at least 6 characters" });
+    }
+
+    const user = await User.findOne({
+      resetToken: token,
+      resetExpires: { $gt: Date.now() },
+    });
+    if (!user)
+      return res.status(400).json({ error: "Invalid or expired reset token" });
+
+    user.hashedPassword = await bcrypt.hash(newPassword, SALT_ROUNDS);
+    user.resetToken = undefined;
+    user.resetExpires = undefined;
+    user.loginAttempts = 0; // Reset login attempts on password change
+    user.isLocked = false;
+    user.lockUntil = undefined;
+    await user.save();
+
+    res.json({ ok: true, message: "Password reset successful" });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// ─── Occasion Sections (admin CRUD) ───────────────────────────────────────────
+
+// GET  /api/admin/occasions  — list all sections sorted by order
+router.get(
+  "/occasions",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const OccasionSection = (await import("../models/OccasionSection.js"))
+        .default;
+      const items = await OccasionSection.find().sort({
+        order: 1,
+        createdAt: 1,
+      });
+      res.json({ items });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// POST /api/admin/occasions  — create a new section
+router.post(
+  "/occasions",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const OccasionSection = (await import("../models/OccasionSection.js"))
+        .default;
+      const payload = req.body || {};
+      const last = await OccasionSection.findOne().sort({ order: -1 });
+      payload.order = last ? last.order + 1 : 0;
+      const section = new OccasionSection(payload);
+      await section.save();
+      res.json({ ok: true, section });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// GET /api/admin/occasions/:id  — single section
+router.get(
+  "/occasions/:id",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const OccasionSection = (await import("../models/OccasionSection.js"))
+        .default;
+      const section = await OccasionSection.findById(req.params.id);
+      if (!section) return res.status(404).json({ error: "Not found" });
+      res.json({ section });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// PUT /api/admin/occasions/:id  — update section (title, cards, isActive, order, etc.)
+router.put(
+  "/occasions/:id",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const OccasionSection = (await import("../models/OccasionSection.js"))
+        .default;
+      const updates = { ...req.body, updatedAt: Date.now() };
+      const section = await OccasionSection.findByIdAndUpdate(
+        req.params.id,
+        updates,
+        { new: true, runValidators: true },
+      );
+      if (!section) return res.status(404).json({ error: "Not found" });
+      res.json({ ok: true, section });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// DELETE /api/admin/occasions/:id  — permanently delete a section
+router.delete(
+  "/occasions/:id",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const OccasionSection = (await import("../models/OccasionSection.js"))
+        .default;
+      const section = await OccasionSection.findByIdAndDelete(req.params.id);
+      if (!section) return res.status(404).json({ error: "Not found" });
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// PUT /api/admin/occasions/reorder  — update order for multiple sections at once
+// body: [ { _id, order }, … ]
+router.put(
+  "/occasions-reorder",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const OccasionSection = (await import("../models/OccasionSection.js"))
+        .default;
+      const items = req.body || [];
+      await Promise.all(
+        items.map(({ _id, order }) =>
+          OccasionSection.findByIdAndUpdate(_id, { order }),
+        ),
+      );
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// ─── Featured Sections (admin CRUD) ───────────────────────────────────────────
+
+// GET  /api/admin/featured  — list all featured sections sorted by order
+router.get(
+  "/featured",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const FeaturedSection = (await import("../models/FeaturedSection.js"))
+        .default;
+      const items = await FeaturedSection.find().sort({
+        order: 1,
+        createdAt: 1,
+      });
+      res.json({ items });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// POST /api/admin/featured  — create a new featured section
+router.post(
+  "/featured",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const FeaturedSection = (await import("../models/FeaturedSection.js"))
+        .default;
+      const payload = req.body || {};
+      // Video carousels don't collect a title from the admin — use the
+      // tagline (subtitle) as their heading instead.
+      if (payload.type === "video" && !payload.title) {
+        payload.title = payload.subtitle || "Video Carousel";
+      }
+      const last = await FeaturedSection.findOne().sort({ order: -1 });
+      payload.order = last ? last.order + 1 : 0;
+      const section = new FeaturedSection(payload);
+      await section.save();
+      res.json({ ok: true, section });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// GET /api/admin/featured/:id  — single featured section
+router.get(
+  "/featured/:id",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const FeaturedSection = (await import("../models/FeaturedSection.js"))
+        .default;
+      const section = await FeaturedSection.findById(req.params.id);
+      if (!section) return res.status(404).json({ error: "Not found" });
+      res.json({ section });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// PUT /api/admin/featured/:id  — update a featured section
+router.put(
+  "/featured/:id",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const FeaturedSection = (await import("../models/FeaturedSection.js"))
+        .default;
+      const updates = { ...req.body, updatedAt: Date.now() };
+      if (updates.type === "video" && !updates.title) {
+        updates.title = updates.subtitle || "Video Carousel";
+      }
+      const section = await FeaturedSection.findByIdAndUpdate(
+        req.params.id,
+        updates,
+        { new: true, runValidators: true },
+      );
+      if (!section) return res.status(404).json({ error: "Not found" });
+      res.json({ ok: true, section });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// DELETE /api/admin/featured/:id  — permanently delete a featured section
+router.delete(
+  "/featured/:id",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const FeaturedSection = (await import("../models/FeaturedSection.js"))
+        .default;
+      const section = await FeaturedSection.findByIdAndDelete(req.params.id);
+      if (!section) return res.status(404).json({ error: "Not found" });
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// PUT /api/admin/featured-reorder  — update order for multiple sections at once
+// body: [ { _id, order }, … ]
+router.put(
+  "/featured-reorder",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const FeaturedSection = (await import("../models/FeaturedSection.js"))
+        .default;
+      const items = req.body || [];
+      await Promise.all(
+        items.map(({ _id, order }) =>
+          FeaturedSection.findByIdAndUpdate(_id, { order }),
+        ),
+      );
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// ─── Homepage Layout (admin: reorder/toggle top-level homepage blocks) ──────
+
+// GET /api/admin/homepage-layout — list all homepage blocks (fixed + one row
+// per individual Featured Row) sorted by order. Self-seeds/self-heals so the
+// list always reflects FIXED_REGISTRY and the current FeaturedSection docs
+// without needing a manual migration step.
+router.get(
+  "/homepage-layout",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const { default: HomepageLayout, FIXED_REGISTRY } = await import(
+        "../models/HomepageLayout.js"
+      );
+      const { default: FeaturedSection } = await import(
+        "../models/FeaturedSection.js"
+      );
+
+      const [existingFixed, existingRows, productSections] = await Promise.all([
+        HomepageLayout.find({ type: "fixed" }).select("key"),
+        HomepageLayout.find({ type: "featuredRow" }),
+        FeaturedSection.find({ type: { $ne: "video" } }).select("_id title"),
+      ]);
+
+      const nextOrder = async () => {
+        const last = await HomepageLayout.findOne().sort({ order: -1 });
+        return (last?.order ?? -1) + 1;
+      };
+
+      // 1) Seed any FIXED_REGISTRY keys not yet in the DB. New keys are
+      // inserted right after their nearest already-seeded predecessor in
+      // FIXED_REGISTRY (falling back to the very end if none precede it),
+      // so e.g. adding a block between "banner" and "shopByCategory" in the
+      // registry places it there for existing sites too — not at the bottom.
+      const existingFixedKeys = new Set(existingFixed.map((e) => e.key));
+      const missingFixed = FIXED_REGISTRY.filter(
+        (r) => !existingFixedKeys.has(r.key),
+      );
+      if (missingFixed.length) {
+        const allSorted = await HomepageLayout.find().sort({ order: 1 });
+        for (const r of missingFixed) {
+          const idx = FIXED_REGISTRY.findIndex((x) => x.key === r.key);
+          let afterOrder = null;
+          for (let i = idx - 1; i >= 0; i--) {
+            const found = allSorted.find(
+              (c) => c.type === "fixed" && c.key === FIXED_REGISTRY[i].key,
+            );
+            if (found) {
+              afterOrder = found.order;
+              break;
+            }
+          }
+          let newOrder;
+          if (afterOrder === null) {
+            newOrder = allSorted.length ? allSorted[0].order - 1 : 0;
+          } else {
+            const next = allSorted.find((c) => c.order > afterOrder);
+            newOrder = next ? (afterOrder + next.order) / 2 : afterOrder + 1;
+          }
+          const doc = await HomepageLayout.findOneAndUpdate(
+            { type: "fixed", key: r.key },
+            { $setOnInsert: { type: "fixed", key: r.key, label: r.label, order: newOrder } },
+            { upsert: true, new: true },
+          );
+          allSorted.push(doc);
+          allSorted.sort((a, b) => a.order - b.order);
+        }
+      }
+
+      // 2) Remove fixed rows whose key was retired from FIXED_REGISTRY
+      // (e.g. the old single "featuredSections" block).
+      const registryKeys = new Set(FIXED_REGISTRY.map((r) => r.key));
+      const staleFixedKeys = existingFixed
+        .map((e) => e.key)
+        .filter((k) => !registryKeys.has(k));
+      if (staleFixedKeys.length) {
+        await HomepageLayout.deleteMany({
+          type: "fixed",
+          key: { $in: staleFixedKeys },
+        });
+      }
+
+      // 3) Seed a featuredRow entry for any product-type FeaturedSection that
+      // doesn't have one yet.
+      const rowSectionIds = new Set(
+        existingRows.map((r) => String(r.featuredSectionId)),
+      );
+      const missingRows = productSections.filter(
+        (s) => !rowSectionIds.has(String(s._id)),
+      );
+      if (missingRows.length) {
+        let order = await nextOrder();
+        await Promise.all(
+          missingRows.map((s) =>
+            HomepageLayout.findOneAndUpdate(
+              { type: "featuredRow", featuredSectionId: s._id },
+              {
+                $setOnInsert: {
+                  type: "featuredRow",
+                  featuredSectionId: s._id,
+                  label: s.title,
+                  order: order++,
+                },
+              },
+              { upsert: true },
+            ),
+          ),
+        );
+      }
+
+      // 4) Drop featuredRow entries whose section was deleted or switched to
+      // type 'video' (video carousels stay grouped, not individually placed).
+      const productSectionIds = new Set(
+        productSections.map((s) => String(s._id)),
+      );
+      const orphanRowIds = existingRows
+        .filter((r) => !productSectionIds.has(String(r.featuredSectionId)))
+        .map((r) => r._id);
+      if (orphanRowIds.length) {
+        await HomepageLayout.deleteMany({ _id: { $in: orphanRowIds } });
+      }
+
+      // 5) Refresh labels that drifted from the section's current title.
+      const titleBySectionId = Object.fromEntries(
+        productSections.map((s) => [String(s._id), s.title]),
+      );
+      const staleLabelRows = existingRows.filter((r) => {
+        const currentTitle = titleBySectionId[String(r.featuredSectionId)];
+        return currentTitle && currentTitle !== r.label;
+      });
+      if (staleLabelRows.length) {
+        await Promise.all(
+          staleLabelRows.map((r) =>
+            HomepageLayout.findByIdAndUpdate(r._id, {
+              label: titleBySectionId[String(r.featuredSectionId)],
+            }),
+          ),
+        );
+      }
+
+      const items = await HomepageLayout.find().sort({ order: 1 });
+      res.json({ items });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// PUT /api/admin/homepage-layout-reorder — update order for multiple blocks at once
+// body: [ { _id, order }, … ]
+router.put(
+  "/homepage-layout-reorder",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const { default: HomepageLayout } = await import(
+        "../models/HomepageLayout.js"
+      );
+      const items = req.body || [];
+      await Promise.all(
+        items.map(({ _id, order }) =>
+          HomepageLayout.findByIdAndUpdate(_id, { order }),
+        ),
+      );
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// PUT /api/admin/homepage-layout/:id — toggle a block's visibility
+router.put(
+  "/homepage-layout/:id",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const { default: HomepageLayout } = await import(
+        "../models/HomepageLayout.js"
+      );
+      const updated = await HomepageLayout.findByIdAndUpdate(
+        req.params.id,
+        { isActive: !!req.body.isActive, updatedAt: Date.now() },
+        { new: true },
+      );
+      if (!updated) return res.status(404).json({ error: "Not found" });
+      res.json({ item: updated });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// ─── Promo Strip Items (admin CRUD) ─────────────────────────────────────────
+
+// GET /api/admin/promo-strip — list all promo strip items sorted by order
+router.get(
+  "/promo-strip",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const PromoStripItem = (await import("../models/PromoStripItem.js"))
+        .default;
+      const items = await PromoStripItem.find().sort({
+        order: 1,
+        createdAt: 1,
+      });
+      res.json({ items });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// POST /api/admin/promo-strip — create a new promo strip item
+router.post(
+  "/promo-strip",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const PromoStripItem = (await import("../models/PromoStripItem.js"))
+        .default;
+      const payload = req.body || {};
+      const last = await PromoStripItem.findOne().sort({ order: -1 });
+      payload.order = last ? last.order + 1 : 0;
+      const item = new PromoStripItem(payload);
+      await item.save();
+      res.json({ ok: true, item });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// GET /api/admin/promo-strip/:id — single promo strip item
+router.get(
+  "/promo-strip/:id",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const PromoStripItem = (await import("../models/PromoStripItem.js"))
+        .default;
+      const item = await PromoStripItem.findById(req.params.id);
+      if (!item) return res.status(404).json({ error: "Not found" });
+      res.json({ item });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// PUT /api/admin/promo-strip/:id — update promo strip item
+router.put(
+  "/promo-strip/:id",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const PromoStripItem = (await import("../models/PromoStripItem.js"))
+        .default;
+      const updates = { ...req.body, updatedAt: Date.now() };
+      const item = await PromoStripItem.findByIdAndUpdate(
+        req.params.id,
+        updates,
+        { new: true, runValidators: true },
+      );
+      if (!item) return res.status(404).json({ error: "Not found" });
+      res.json({ ok: true, item });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// DELETE /api/admin/promo-strip/:id — delete promo strip item
+router.delete(
+  "/promo-strip/:id",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const PromoStripItem = (await import("../models/PromoStripItem.js"))
+        .default;
+      const item = await PromoStripItem.findByIdAndDelete(req.params.id);
+      if (!item) return res.status(404).json({ error: "Not found" });
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// PUT /api/admin/promo-strip-reorder — batch update order
+// body: [ { _id, order }, … ]
+router.put(
+  "/promo-strip-reorder",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const PromoStripItem = (await import("../models/PromoStripItem.js"))
+        .default;
+      const items = req.body || [];
+      await Promise.all(
+        items.map(({ _id, order }) =>
+          PromoStripItem.findByIdAndUpdate(_id, { order }),
+        ),
+      );
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// ─── Banners (admin CRUD) ─────────────────────────────────────────────────────
+
+router.get(
+  "/banners",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const Banner = (await import("../models/Banner.js")).default;
+      const items = await Banner.find().sort({ order: 1, createdAt: 1 });
+      res.json({ items });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+router.post(
+  "/banners",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const Banner = (await import("../models/Banner.js")).default;
+      const payload = req.body || {};
+      const last = await Banner.findOne().sort({ order: -1 });
+      payload.order = last ? last.order + 1 : 0;
+      const banner = new Banner(payload);
+      await banner.save();
+      res.json({ ok: true, banner });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+router.get(
+  "/banners/:id",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const Banner = (await import("../models/Banner.js")).default;
+      const banner = await Banner.findById(req.params.id);
+      if (!banner) return res.status(404).json({ error: "Not found" });
+      res.json({ banner });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+router.put(
+  "/banners/:id",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const Banner = (await import("../models/Banner.js")).default;
+      const updates = { ...req.body, updatedAt: Date.now() };
+      const banner = await Banner.findByIdAndUpdate(req.params.id, updates, {
+        new: true,
+      });
+      if (!banner) return res.status(404).json({ error: "Not found" });
+      res.json({ ok: true, banner });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+router.delete(
+  "/banners/:id",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const Banner = (await import("../models/Banner.js")).default;
+      const banner = await Banner.findByIdAndDelete(req.params.id);
+      if (!banner) return res.status(404).json({ error: "Not found" });
+      // optionally remove from Cloudinary
+      if (banner.image?.public_id) {
+        try {
+          ensureCloudinaryConfigured();
+          await destroyAsset(banner.image.public_id, {
+            resource_type: "image",
+          });
+        } catch {
+          /* ignore Cloudinary errors */
+        }
+      }
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+router.put(
+  "/banners-reorder",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const Banner = (await import("../models/Banner.js")).default;
+      const items = req.body || [];
+      await Promise.all(
+        items.map(({ _id, order }) => Banner.findByIdAndUpdate(_id, { order })),
+      );
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// ─── Promo Panels (admin CRUD – for Popular Picks left panel) ────────────────
+
+router.get(
+  "/promo-panels",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const PromoPanel = (await import("../models/PromoPanel.js")).default;
+      const items = await PromoPanel.find()
+        .sort({ order: 1, createdAt: 1 })
+        .populate(
+          "productIds",
+          "title price compareAtPrice images availability inventory averageRating reviewCount badges variants _id slug",
+        );
+      res.json({ items });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+router.post(
+  "/promo-panels",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const PromoPanel = (await import("../models/PromoPanel.js")).default;
+      const payload = req.body || {};
+      const last = await PromoPanel.findOne().sort({ order: -1 });
+      payload.order = last ? last.order + 1 : 0;
+      const panel = new PromoPanel(payload);
+      await panel.save();
+      res.json({ ok: true, panel });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+router.get(
+  "/promo-panels/:id",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const PromoPanel = (await import("../models/PromoPanel.js")).default;
+      const panel = await PromoPanel.findById(req.params.id).populate(
+        "productIds",
+        "title price compareAtPrice images availability inventory averageRating reviewCount badges variants _id slug",
+      );
+      if (!panel) return res.status(404).json({ error: "Not found" });
+      res.json({ panel });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+router.put(
+  "/promo-panels/:id",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const PromoPanel = (await import("../models/PromoPanel.js")).default;
+      const updates = { ...req.body, updatedAt: Date.now() };
+      const panel = await PromoPanel.findByIdAndUpdate(req.params.id, updates, {
+        new: true,
+      });
+      if (!panel) return res.status(404).json({ error: "Not found" });
+      res.json({ ok: true, panel });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+router.delete(
+  "/promo-panels/:id",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const PromoPanel = (await import("../models/PromoPanel.js")).default;
+      const panel = await PromoPanel.findByIdAndDelete(req.params.id);
+      if (!panel) return res.status(404).json({ error: "Not found" });
+      if (panel.image?.public_id) {
+        try {
+          ensureCloudinaryConfigured();
+          await destroyAsset(panel.image.public_id, {
+            resource_type: "image",
+          });
+        } catch {
+          /* ignore Cloudinary errors */
+        }
+      }
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+router.put(
+  "/promo-panels-reorder",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const PromoPanel = (await import("../models/PromoPanel.js")).default;
+      const items = req.body || [];
+      await Promise.all(
+        items.map(({ _id, order }) =>
+          PromoPanel.findByIdAndUpdate(_id, { order }),
+        ),
+      );
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// ─── Testimonials (admin CRUD – homepage "What Our Customers Say") ──────────
+
+router.get(
+  "/testimonials",
+  requireAdmin,
+  requirePermission("content.promo"),
+  async (req, res) => {
+    try {
+      const Testimonial = (await import("../models/Testimonial.js")).default;
+      const items = await Testimonial.find().sort({ order: 1, createdAt: 1 });
+      res.json({ items });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+router.post(
+  "/testimonials",
+  requireAdmin,
+  requirePermission("content.promo"),
+  async (req, res) => {
+    try {
+      const Testimonial = (await import("../models/Testimonial.js")).default;
+      const payload = req.body || {};
+      const last = await Testimonial.findOne().sort({ order: -1 });
+      payload.order = last ? last.order + 1 : 0;
+      const item = new Testimonial(payload);
+      await item.save();
+      res.json({ ok: true, item });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+router.get(
+  "/testimonials/:id",
+  requireAdmin,
+  requirePermission("content.promo"),
+  async (req, res) => {
+    try {
+      const Testimonial = (await import("../models/Testimonial.js")).default;
+      const item = await Testimonial.findById(req.params.id);
+      if (!item) return res.status(404).json({ error: "Not found" });
+      res.json({ item });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+router.put(
+  "/testimonials/:id",
+  requireAdmin,
+  requirePermission("content.promo"),
+  async (req, res) => {
+    try {
+      const Testimonial = (await import("../models/Testimonial.js")).default;
+      const updates = { ...req.body, updatedAt: Date.now() };
+      const item = await Testimonial.findByIdAndUpdate(req.params.id, updates, {
+        new: true,
+      });
+      if (!item) return res.status(404).json({ error: "Not found" });
+      res.json({ ok: true, item });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+router.delete(
+  "/testimonials/:id",
+  requireAdmin,
+  requirePermission("content.promo"),
+  async (req, res) => {
+    try {
+      const Testimonial = (await import("../models/Testimonial.js")).default;
+      const item = await Testimonial.findByIdAndDelete(req.params.id);
+      if (!item) return res.status(404).json({ error: "Not found" });
+      if (item.avatar?.public_id) {
+        try {
+          ensureCloudinaryConfigured();
+          await destroyAsset(item.avatar.public_id, {
+            resource_type: "image",
+          });
+        } catch {
+          /* ignore Cloudinary errors */
+        }
+      }
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+router.put(
+  "/testimonials-reorder",
+  requireAdmin,
+  requirePermission("content.promo"),
+  async (req, res) => {
+    try {
+      const Testimonial = (await import("../models/Testimonial.js")).default;
+      const items = req.body || [];
+      await Promise.all(
+        items.map(({ _id, order }) =>
+          Testimonial.findByIdAndUpdate(_id, { order }),
+        ),
+      );
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// ─── Popup (admin CRUD – singleton) ──────────────────────────────────────────
+
+// GET current popup settings
+router.get(
+  "/popup",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const Popup = (await import("../models/Popup.js")).default;
+      const popup = await Popup.findOne();
+      res.json({ popup: popup || null });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// PUT (upsert) popup settings
+router.put(
+  "/popup",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const Popup = (await import("../models/Popup.js")).default;
+      const { image, link, isActive } = req.body;
+      let popup = await Popup.findOne();
+      if (popup) {
+        if (image !== undefined) popup.image = image;
+        if (link !== undefined) popup.link = link;
+        if (isActive !== undefined) popup.isActive = isActive;
+        await popup.save();
+      } else {
+        popup = await new Popup({ image, link, isActive }).save();
+      }
+      res.json({ ok: true, popup });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// DELETE popup image (reset to empty)
+router.delete(
+  "/popup",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const Popup = (await import("../models/Popup.js")).default;
+      const popup = await Popup.findOne();
+      if (popup?.image?.public_id) {
+        try {
+          ensureCloudinaryConfigured();
+          await destroyAsset(popup.image.public_id, {
+            resource_type: "image",
+          });
+        } catch {
+          /* ignore Cloudinary errors */
+        }
+      }
+      await Popup.deleteMany();
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// ─── Media Library (Cloudinary) ────────────────────────────────────────────────
+
+// GET /api/admin/media?folder=&next_cursor=&q=
+// Lists images and videos stored in Cloudinary (up to 60 per page)
+router.get(
+  "/media",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      ensureCloudinaryConfigured();
+      const { folder = "", next_cursor, q } = req.query;
+
+      const buildOpts = (resource_type) => {
+        const opts = { type: "upload", resource_type, max_results: 30 };
+        if (folder) opts.prefix = folder;
+        if (next_cursor) opts.next_cursor = next_cursor;
+        return opts;
+      };
+
+      const [imgResult, vidResult] = await Promise.all([
+        cloudinary.api
+          .resources(buildOpts("image"))
+          .catch(() => ({ resources: [] })),
+        cloudinary.api
+          .resources(buildOpts("video"))
+          .catch(() => ({ resources: [] })),
+      ]);
+
+      let resources = [
+        ...(imgResult.resources || []).map((r) => ({
+          ...r,
+          resource_type: "image",
+        })),
+        ...(vidResult.resources || []).map((r) => ({
+          ...r,
+          resource_type: "video",
+        })),
+      ].sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+      if (q) {
+        const lower = q.toLowerCase();
+        resources = resources.filter((r) =>
+          r.public_id.toLowerCase().includes(lower),
+        );
+      }
+
+      const cloudItems = resources.map((r) => ({
+        public_id: r.public_id,
+        url: r.secure_url || r.url,
+        resource_type: r.resource_type,
+        width: r.width,
+        height: r.height,
+        bytes: r.bytes,
+        format: r.format,
+        created_at: r.created_at,
+        folder: r.folder || r.public_id.split("/").slice(0, -1).join("/"),
+      }));
+
+      // Merge locally-stored uploads (only on the first page — they have no
+      // Cloudinary cursor). New uploads live on local disk, legacy ones on
+      // Cloudinary, so the grid shows both.
+      const localItems = next_cursor
+        ? []
+        : await listLocalMedia({ folder, q });
+
+      res.json({
+        items: [...localItems, ...cloudItems].sort(
+          (a, b) => new Date(b.created_at) - new Date(a.created_at),
+        ),
+        next_cursor: imgResult.next_cursor || vidResult.next_cursor || null,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message || "Cloudinary error" });
+    }
+  },
+);
+
+// GET /api/admin/media/folders  — list all folder prefixes found across uploaded assets
+router.get(
+  "/media/folders",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      ensureCloudinaryConfigured();
+      const result = await cloudinary.api.root_folders();
+      const folders = (result.folders || []).map((f) => f.path);
+      res.json({ folders });
+    } catch (err) {
+      // non-fatal — return empty list
+      res.json({ folders: [] });
+    }
+  },
+);
+
+// DELETE /api/admin/media  — delete one or more images/videos from Cloudinary
+// body: { public_ids: ['folder/name', ...], resource_type?: 'image'|'video' }
+router.delete(
+  "/media",
+  requireAdmin,
+  requirePermission("content"),
+  async (req, res) => {
+    try {
+      const { public_ids, resource_type } = req.body || {};
+      if (!Array.isArray(public_ids) || public_ids.length === 0) {
+        return res.status(400).json({ error: "public_ids array required" });
+      }
+
+      // Split into local (on-disk) vs legacy Cloudinary ids and delete each
+      // from its own backing store.
+      const localIds = public_ids.filter((id) => isLocalPublicId(id));
+      const cloudIds = public_ids.filter((id) => !isLocalPublicId(id));
+
+      const deleted = {};
+      await Promise.all(
+        localIds.map(async (id) => {
+          await deleteLocalAsset(id);
+          deleted[id] = "deleted";
+        }),
+      );
+
+      if (cloudIds.length > 0) {
+        ensureCloudinaryConfigured();
+        const type = resource_type === "video" ? "video" : "image";
+        const result = await cloudinary.api.delete_resources(cloudIds, {
+          resource_type: type,
+        });
+        Object.assign(deleted, result.deleted || {});
+      }
+
+      res.json({ ok: true, deleted });
+    } catch (err) {
+      res.status(500).json({ error: err.message || "Delete failed" });
+    }
+  },
+);
+
+// ─── Discounts / Offers (admin CRUD) ─────────────────────────────────────────
+
+router.get(
+  "/discounts",
+  requireAdmin,
+  requireAnyPermission(["content", "catalog"]),
+  async (req, res) => {
+    try {
+      const Discount = (await import("../models/Discount.js")).default;
+      const items = await Discount.find().sort({ order: 1, createdAt: 1 });
+      res.json({ items });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+router.post(
+  "/discounts",
+  requireAdmin,
+  requireAnyPermission(["content", "catalog"]),
+  async (req, res) => {
+    try {
+      const Discount = (await import("../models/Discount.js")).default;
+      const payload = req.body || {};
+      const last = await Discount.findOne().sort({ order: -1 });
+      payload.order = last ? last.order + 1 : 0;
+      const item = new Discount(payload);
+      await item.save();
+      res.json({ ok: true, item });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+router.put(
+  "/discounts-reorder",
+  requireAdmin,
+  requireAnyPermission(["content", "catalog"]),
+  async (req, res) => {
+    try {
+      const Discount = (await import("../models/Discount.js")).default;
+      const items = req.body || [];
+      await Promise.all(
+        items.map(({ _id, order }) =>
+          Discount.findByIdAndUpdate(_id, { order }),
+        ),
+      );
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+router.put(
+  "/discounts/:id",
+  requireAdmin,
+  requireAnyPermission(["content", "catalog"]),
+  async (req, res) => {
+    try {
+      const Discount = (await import("../models/Discount.js")).default;
+      const updates = { ...req.body, updatedAt: Date.now() };
+      const item = await Discount.findByIdAndUpdate(req.params.id, updates, {
+        new: true,
+      });
+      if (!item) return res.status(404).json({ error: "Not found" });
+      res.json({ ok: true, item });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+router.delete(
+  "/discounts/:id",
+  requireAdmin,
+  requireAnyPermission(["content", "catalog"]),
+  async (req, res) => {
+    try {
+      const Discount = (await import("../models/Discount.js")).default;
+      const item = await Discount.findByIdAndDelete(req.params.id);
+      if (!item) return res.status(404).json({ error: "Not found" });
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// Waitlist routes
+router.get(
+  "/waitlist",
+  requireAdmin,
+  requirePermission("catalog"),
+  async (req, res) => {
+    try {
+      const Waitlist = (await import("../models/Waitlist.js")).default;
+      const { productId, notified } = req.query;
+      const filter = {};
+      if (productId) filter.productId = productId;
+      if (notified !== undefined) filter.notified = notified === "true";
+      const entries = await Waitlist.find(filter).sort({ createdAt: -1 });
+      res.json({ entries });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+router.put(
+  "/waitlist/:id/notified",
+  requireAdmin,
+  requirePermission("catalog"),
+  async (req, res) => {
+    try {
+      const Waitlist = (await import("../models/Waitlist.js")).default;
+      const entry = await Waitlist.findByIdAndUpdate(
+        req.params.id,
+        { notified: true },
+        { new: true },
+      );
+      if (!entry) return res.status(404).json({ error: "Not found" });
+      res.json({ ok: true, entry });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+router.delete(
+  "/waitlist/:id",
+  requireAdmin,
+  requirePermission("catalog"),
+  async (req, res) => {
+    try {
+      const Waitlist = (await import("../models/Waitlist.js")).default;
+      const entry = await Waitlist.findByIdAndDelete(req.params.id);
+      if (!entry) return res.status(404).json({ error: "Not found" });
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// ─── Admin Orders ─────────────────────────────────────────────────────────────
+
+// GET /api/admin/dashboard-overview
+router.get("/dashboard-overview", requireAdmin, async (req, res) => {
+  try {
+    const now = new Date();
+
+    const startOfDay = (date) => {
+      const d = new Date(date);
+      d.setHours(0, 0, 0, 0);
+      return d;
+    };
+
+    const addDays = (date, days) => {
+      const d = new Date(date);
+      d.setDate(d.getDate() + days);
+      return d;
+    };
+
+    const todayStart = startOfDay(now);
+    const tomorrowStart = addDays(todayStart, 1);
+    const yesterdayStart = addDays(todayStart, -1);
+    const last7Start = addDays(todayStart, -6);
+    const last30Start = addDays(todayStart, -29);
+
+    const summarizeRange = async (start, end) => {
+      const match = { createdAt: { $gte: start, $lt: end } };
+      const [count, salesAgg, profitAgg, pending] = await Promise.all([
+        Order.countDocuments(match),
+        Order.aggregate([
+          { $match: { ...match, status: { $nin: ["cancelled", "failed"] } } },
+          { $group: { _id: null, total: { $sum: "$total" } } },
+        ]),
+        Order.aggregate([
+          { $match: { ...match, status: { $nin: ["cancelled", "failed"] } } },
+          {
+            $group: {
+              _id: null,
+              total: { $sum: { $subtract: ["$subtotal", "$discount"] } },
+            },
+          },
+        ]),
+        Order.countDocuments({ ...match, status: "pending" }),
+      ]);
+
+      return {
+        orders: count,
+        sales: salesAgg[0]?.total || 0,
+        profit: profitAgg[0]?.total || 0,
+        pending,
+      };
+    };
+
+    const last12MonthsStart = new Date(now);
+    last12MonthsStart.setMonth(last12MonthsStart.getMonth() - 11);
+    last12MonthsStart.setDate(1);
+    last12MonthsStart.setHours(0, 0, 0, 0);
+
+    const [
+      totalOrders,
+      pendingOrders,
+      processingOrders,
+      statusCountsAgg,
+      salesAgg,
+      profitAgg,
+      recentOrders,
+      unpaidOnlineOrders,
+      todaySummary,
+      yesterdaySummary,
+      last7Summary,
+      last30Summary,
+      topProductsAgg,
+      hourlyRevenueAgg,
+      trackedProducts,
+      monthlyRevenueAgg,
+      paymentMethodAgg,
+      newCustomersCount,
+      returningCustomersCount,
+    ] = await Promise.all([
+      Order.countDocuments(),
+      Order.countDocuments({ status: "pending" }),
+      Order.countDocuments({ status: "processing" }),
+      Order.aggregate([{ $group: { _id: "$status", count: { $sum: 1 } } }]),
+      Order.aggregate([
+        { $match: { status: { $nin: ["cancelled", "failed"] } } },
+        { $group: { _id: null, total: { $sum: "$total" } } },
+      ]),
+      Order.aggregate([
+        { $match: { status: { $nin: ["cancelled", "failed"] } } },
+        {
+          $group: {
+            _id: null,
+            total: { $sum: { $subtract: ["$subtotal", "$discount"] } },
+          },
+        },
+      ]),
+      Order.find({}).sort({ createdAt: -1 }).limit(8).lean(),
+      Order.countDocuments({
+        paymentMethod: { $in: ["online", "bkash"] },
+        paymentStatus: "unpaid",
+      }),
+      summarizeRange(todayStart, tomorrowStart),
+      summarizeRange(yesterdayStart, todayStart),
+      summarizeRange(last7Start, tomorrowStart),
+      summarizeRange(last30Start, tomorrowStart),
+      Order.aggregate([
+        {
+          $match: {
+            createdAt: { $gte: last30Start, $lt: tomorrowStart },
+            status: { $nin: ["cancelled", "failed"] },
+          },
+        },
+        { $unwind: "$items" },
+        {
+          $group: {
+            _id: "$items.productId",
+            title: { $first: "$items.title" },
+            unitsSold: { $sum: "$items.quantity" },
+            revenue: {
+              $sum: { $multiply: ["$items.price", "$items.quantity"] },
+            },
+          },
+        },
+        { $sort: { unitsSold: -1, revenue: -1 } },
+        { $limit: 8 },
+      ]),
+      Order.aggregate([
+        {
+          $match: {
+            createdAt: { $gte: todayStart, $lt: tomorrowStart },
+            status: { $nin: ["cancelled", "failed"] },
+          },
+        },
+        {
+          $group: {
+            _id: { $hour: "$createdAt" },
+            revenue: { $sum: "$total" },
+            orders: { $sum: 1 },
+          },
+        },
+        { $sort: { _id: 1 } },
+      ]),
+      Product.find({ status: { $ne: "archived" } })
+        .select("title inventory variants updatedAt")
+        .lean(),
+      // Monthly revenue for the last 12 months
+      Order.aggregate([
+        {
+          $match: {
+            createdAt: { $gte: last12MonthsStart },
+            status: { $nin: ["cancelled", "failed"] },
+          },
+        },
+        {
+          $group: {
+            _id: {
+              year: { $year: "$createdAt" },
+              month: { $month: "$createdAt" },
+            },
+            revenue: { $sum: "$total" },
+            orders: { $sum: 1 },
+          },
+        },
+        { $sort: { "_id.year": 1, "_id.month": 1 } },
+      ]),
+      // Revenue by payment method (last 30 days)
+      Order.aggregate([
+        {
+          $match: {
+            createdAt: { $gte: last30Start },
+            status: { $nin: ["cancelled", "failed"] },
+          },
+        },
+        {
+          $group: {
+            _id: "$paymentMethod",
+            revenue: { $sum: "$total" },
+            count: { $sum: 1 },
+          },
+        },
+        { $sort: { revenue: -1 } },
+      ]),
+      // New customers (registered in last 30 days)
+      User.countDocuments({ createdAt: { $gte: last30Start } }),
+      // Returning customers (placed more than 1 order)
+      Order.aggregate([
+        { $group: { _id: "$billingDetails.phone", orderCount: { $sum: 1 } } },
+        { $match: { orderCount: { $gt: 1 } } },
+        { $count: "total" },
+      ]),
+    ]);
+
+    const statusCounts = statusCountsAgg.reduce((acc, row) => {
+      if (row?._id) acc[row._id] = row.count;
+      return acc;
+    }, {});
+
+    const hourlyMap = hourlyRevenueAgg.reduce((acc, row) => {
+      acc[row._id] = { revenue: row.revenue || 0, orders: row.orders || 0 };
+      return acc;
+    }, {});
+
+    const hourlyRevenue = Array.from({ length: 24 }, (_, hour) => ({
+      hour,
+      revenue: hourlyMap[hour]?.revenue || 0,
+      orders: hourlyMap[hour]?.orders || 0,
+    }));
+
+    const lowStockThreshold = 5;
+    const stockRows = trackedProducts.map((product) => {
+      const variantTotal =
+        Array.isArray(product.variants) && product.variants.length
+          ? product.variants.reduce(
+              (sum, variant) => sum + (Number(variant.inventory) || 0),
+              0,
+            )
+          : null;
+      const totalInventory =
+        variantTotal !== null ? variantTotal : Number(product.inventory) || 0;
+
+      return {
+        _id: product._id,
+        title: product.title,
+        totalInventory,
+        updatedAt: product.updatedAt,
+      };
+    });
+
+    const outOfStock = stockRows
+      .filter((row) => row.totalInventory <= 0)
+      .sort((a, b) => a.totalInventory - b.totalInventory)
+      .slice(0, 8);
+
+    const lowStock = stockRows
+      .filter(
+        (row) =>
+          row.totalInventory > 0 && row.totalInventory <= lowStockThreshold,
+      )
+      .sort((a, b) => a.totalInventory - b.totalInventory)
+      .slice(0, 8);
+
+    // Build 12-month revenue array with labels
+    const MONTH_NAMES = [
+      "Jan",
+      "Feb",
+      "Mar",
+      "Apr",
+      "May",
+      "Jun",
+      "Jul",
+      "Aug",
+      "Sep",
+      "Oct",
+      "Nov",
+      "Dec",
+    ];
+    const monthlyMap = monthlyRevenueAgg.reduce((acc, row) => {
+      acc[`${row._id.year}-${row._id.month}`] = {
+        revenue: row.revenue,
+        orders: row.orders,
+      };
+      return acc;
+    }, {});
+    const monthlyRevenue = Array.from({ length: 12 }, (_, i) => {
+      const d = new Date(last12MonthsStart);
+      d.setMonth(d.getMonth() + i);
+      const key = `${d.getFullYear()}-${d.getMonth() + 1}`;
+      return {
+        month: MONTH_NAMES[d.getMonth()],
+        year: d.getFullYear(),
+        revenue: monthlyMap[key]?.revenue || 0,
+        orders: monthlyMap[key]?.orders || 0,
+      };
+    });
+
+    res.json({
+      overview: {
+        totalOrders,
+        totalSales: salesAgg[0]?.total || 0,
+        totalProfit: profitAgg[0]?.total || 0,
+        pendingOrders,
+      },
+      reports: {
+        today: todaySummary,
+        yesterday: yesterdaySummary,
+        last7Days: last7Summary,
+        last30Days: last30Summary,
+      },
+      orderFlow: {
+        created: totalOrders,
+        pending: statusCounts.pending || 0,
+        confirmed: statusCounts.confirmed || 0,
+        processing: statusCounts.processing || 0,
+        sentToCourier: statusCounts.shipped || 0,
+        delivered: statusCounts.delivered || 0,
+        cancelled: statusCounts.cancelled || 0,
+        failed: statusCounts.failed || 0,
+      },
+      recentOrders,
+      topSellingProducts: topProductsAgg,
+      hourlyRevenue,
+      monthlyRevenue,
+      paymentBreakdown: paymentMethodAgg.map((p) => ({
+        method: p._id || "unknown",
+        revenue: p.revenue,
+        count: p.count,
+      })),
+      customerStats: {
+        newLast30Days: newCustomersCount,
+        returningCustomers: returningCustomersCount[0]?.total || 0,
+      },
+      stock: {
+        threshold: lowStockThreshold,
+        outOfStockCount: stockRows.filter((row) => row.totalInventory <= 0)
+          .length,
+        lowStockCount: stockRows.filter(
+          (row) =>
+            row.totalInventory > 0 && row.totalInventory <= lowStockThreshold,
+        ).length,
+        outOfStock,
+        lowStock,
+      },
+      actionCenter: {
+        pendingOrders,
+        processingOrders,
+        unpaidOnlineOrders,
+        lowStockCount: stockRows.filter(
+          (row) =>
+            row.totalInventory > 0 && row.totalInventory <= lowStockThreshold,
+        ).length,
+      },
+      generatedAt: now,
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// GET /api/admin/notifications/orders?since=<ISO date> — recent orders for the
+// dashboard notification bell. Lightweight by design (no aggregations) so it
+// can be polled frequently.
+router.get(
+  "/notifications/orders",
+  requireAdmin,
+  requirePermission("orders"),
+  async (req, res) => {
+    try {
+      const since = req.query.since
+        ? new Date(req.query.since)
+        : new Date(Date.now() - 24 * 60 * 60 * 1000);
+      const orders = await Order.find(
+        { createdAt: { $gt: since } },
+        "orderNumber billingDetails userEmail total status paymentMethod createdAt",
+      )
+        .sort({ createdAt: -1 })
+        .limit(20)
+        .lean();
+
+      res.json({
+        ok: true,
+        count: orders.length,
+        serverTime: new Date(),
+        orders: orders.map((o) => ({
+          _id: o._id,
+          orderId: o.orderNumber || formatOrderIdSuffix(o._id),
+          customerName: o.billingDetails?.name || o.userEmail || "Guest",
+          total: o.total,
+          status: o.status,
+          paymentMethod: o.paymentMethod,
+          createdAt: o.createdAt,
+        })),
+      });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// GET /api/admin/orders
+router.get(
+  "/orders",
+  requireAdmin,
+  requirePermission("orders"),
+  async (req, res) => {
+    try {
+      const {
+        page = 1,
+        limit = 20,
+        status,
+        paymentStatus,
+        paymentMethod,
+        q,
+        needsTracking,
+        hasNote,
+        dateFrom,
+        dateTo,
+        userId,
+        trashed,
+      } = req.query;
+      const filter = {};
+      // Recycle bin: ?trashed=true lists only trashed orders; otherwise trashed
+      // orders are hidden from the dashboard.
+      const inTrashView = trashed === "true" || trashed === "1";
+      filter.deletedAt = inTrashView ? { $ne: null } : null;
+      if (userId) filter.userId = userId;
+      if (dateFrom || dateTo) {
+        filter.createdAt = {};
+        if (dateFrom) filter.createdAt.$gte = new Date(dateFrom);
+        if (dateTo) filter.createdAt.$lte = new Date(dateTo);
+      }
+      if (needsTracking === "true" || needsTracking === "1") {
+        filter.status = { $in: ["confirmed", "processing", "shipped"] };
+        filter.$or = [
+          { "shipment.trackingUrl": { $in: [null, ""] } },
+          { "shipment.trackingUrl": { $exists: false } },
+        ];
+      } else if (status === "incomplete") {
+        filter.status = {
+          $in: [
+            "pending",
+            "accepted",
+            "picked",
+            "approved",
+            "confirmed",
+            "processing",
+            "shipped",
+          ],
+        };
+      } else if (status && status !== "all") {
+        filter.status =
+          status === "accepted"
+            ? { $in: ["accepted", "picked", "approved"] }
+            : status;
+      }
+      if (hasNote === "1" || hasNote === "true") {
+        filter["billingDetails.note"] = { $exists: true, $ne: "" };
+      }
+      if (paymentStatus && paymentStatus !== "all")
+        filter.paymentStatus = paymentStatus;
+      if (paymentMethod && paymentMethod !== "all")
+        filter.paymentMethod = paymentMethod;
+      if (q) {
+        filter.$or = [
+          ...orderIdMatchConditions(q),
+          { "billingDetails.name": { $regex: q, $options: "i" } },
+          { "billingDetails.phone": { $regex: q, $options: "i" } },
+          { userEmail: { $regex: q, $options: "i" } },
+          { transactionId: { $regex: q, $options: "i" } },
+        ];
+      }
+      const skip = (parseInt(page) - 1) * parseInt(limit);
+      const [ordersRaw, total] = await Promise.all([
+        Order.find(filter)
+          // trash view sorts by when items were trashed (newest first)
+          .sort(inTrashView ? { deletedAt: -1 } : { createdAt: -1 })
+          .skip(skip)
+          .limit(parseInt(limit))
+          .lean(),
+        Order.countDocuments(filter),
+      ]);
+      const orders = await Promise.all(
+        ordersRaw.map(async (order) => ({
+          ...order,
+          orderId: order.orderNumber || formatOrderIdSuffix(order._id),
+          customerUserId: await resolveCustomerUserId(order),
+        })),
+      );
+      // Summary counts
+      const [
+        pending,
+        accepted,
+        rejected,
+        confirmed,
+        processing,
+        shipped,
+        delivered,
+        returned,
+        cancelled,
+        failed,
+      ] = await Promise.all([
+        // stat counts exclude trashed orders so the tab badges + revenue stay accurate
+        Order.countDocuments({ status: "pending", deletedAt: null }),
+        Order.countDocuments({
+          status: { $in: ["accepted", "picked", "approved"] },
+          deletedAt: null,
+        }),
+        Order.countDocuments({ status: "rejected", deletedAt: null }),
+        Order.countDocuments({ status: "confirmed", deletedAt: null }),
+        Order.countDocuments({ status: "processing", deletedAt: null }),
+        Order.countDocuments({ status: "shipped", deletedAt: null }),
+        Order.countDocuments({ status: "delivered", deletedAt: null }),
+        Order.countDocuments({ status: "returned", deletedAt: null }),
+        Order.countDocuments({ status: "cancelled", deletedAt: null }),
+        Order.countDocuments({ status: "failed", deletedAt: null }),
+      ]);
+      const revenueAgg = await Order.aggregate([
+        {
+          $match: {
+            status: { $nin: ["cancelled", "failed"] },
+            deletedAt: null,
+          },
+        },
+        { $group: { _id: null, total: { $sum: "$total" } } },
+      ]);
+      res.json({
+        orders,
+        total,
+        pages: Math.ceil(total / parseInt(limit)),
+        stats: {
+          all: total,
+          pending,
+          accepted,
+          rejected,
+          confirmed,
+          processing,
+          shipped,
+          delivered,
+          returned,
+          cancelled,
+          failed,
+          revenue: revenueAgg[0]?.total || 0,
+        },
+      });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// POST /api/admin/orders — manually create an order from the dashboard
+// (phone orders, or converting an abandoned cart / checkout). Line-item prices
+// are computed server-side via resolveAndQuote so product-price integrity is
+// preserved; the admin may override the shipping charge and add a manual
+// discount on top of any coupons. Not subject to the storefront's rate limiter
+// or fake-order protection — this is a trusted admin action.
+const MANUAL_ORDER_STATUSES = [
+  "pending",
+  "accepted",
+  "confirmed",
+  "processing",
+  "shipped",
+  "delivered",
+];
+const MANUAL_PAYMENT_STATUSES = ["unpaid", "cod", "paid"];
+router.post(
+  "/orders",
+  requireAdmin,
+  requirePermission("orders"),
+  async (req, res) => {
+    try {
+      const {
+        billingDetails = {},
+        items: clientItems,
+        paymentMethod = "cash-on-delivery",
+        couponCodes,
+        shipping, // optional shipping override
+        manualDiscount, // optional extra discount on top of coupons
+        status, // optional initial status (default pending)
+        paymentStatus, // optional payment status override
+        note,
+        sourceCartUserId, // clear this user's abandoned cart on success
+        sourceCheckoutId, // mark this checkout session completed on success
+      } = req.body || {};
+
+      const name = String(billingDetails.name || "").trim();
+      const phone = String(billingDetails.phone || "").trim();
+      const city = String(billingDetails.city || "").trim();
+      const zone = String(billingDetails.zone || "").trim();
+
+      if (!Array.isArray(clientItems) || clientItems.length === 0) {
+        return res.status(400).json({ error: "Add at least one product." });
+      }
+      if (!name || !phone || !city || !zone) {
+        return res.status(400).json({
+          error: "Customer name, phone, city and zone are required.",
+        });
+      }
+      if (
+        !["cash-on-delivery", "online", "bkash", "nagad", "rocket"].includes(
+          paymentMethod,
+        )
+      ) {
+        return res.status(400).json({ error: "Invalid payment method." });
+      }
+
+      // Link to an existing customer account when the email/phone matches, so
+      // the order appears in their history and courier-score lookups.
+      let linkedEmail = billingDetails.email
+        ? String(billingDetails.email).trim().toLowerCase()
+        : null;
+      const emailUser = linkedEmail
+        ? await User.findOne({ email: linkedEmail }).select("_id email").lean()
+        : null;
+      const linkedUser =
+        emailUser ||
+        (phone
+          ? await User.findOne({ mobile: phone }).select("_id email").lean()
+          : null);
+      const linkedUserId = linkedUser ? String(linkedUser._id) : null;
+      if (!linkedEmail && linkedUser?.email) linkedEmail = linkedUser.email;
+
+      // Server-authoritative pricing. Points are never redeemed on a manual order.
+      let quote;
+      try {
+        quote = await resolveAndQuote(
+          clientItems,
+          couponCodes || null,
+          linkedUserId,
+          city,
+          0,
+          zone,
+          billingDetails.area || null,
+        );
+      } catch (err) {
+        return res.status(err.status || 400).json({ error: err.message });
+      }
+
+      // Products (title/image/variant) are resolved from the DB by the quote,
+      // but the admin may override a line's unit price. clientItems is in the
+      // same order as quote.items, so we can zip them by index.
+      const finalItems = quote.items.map((qi, idx) => {
+        const raw = clientItems[idx]?.price;
+        const hasOverride =
+          raw !== undefined && raw !== null && raw !== "" && Number(raw) >= 0;
+        const price = hasOverride ? Number(raw) : qi.price;
+        return { ...qi, price, lineTotal: price * qi.quantity };
+      });
+      const subtotal = finalItems.reduce(
+        (s, i) => s + i.price * i.quantity,
+        0,
+      );
+
+      const computedShipping =
+        shipping === undefined || shipping === null || shipping === ""
+          ? quote.shipping
+          : Math.max(0, Number(shipping) || 0);
+      const extraDiscount = Math.max(0, Number(manualDiscount) || 0);
+      const discount = (quote.discount || 0) + extraDiscount;
+      const total = Math.max(0, subtotal + computedShipping - discount);
+
+      const initialStatus = MANUAL_ORDER_STATUSES.includes(status)
+        ? status
+        : "pending";
+      const isCodLike = [
+        "cash-on-delivery",
+        "bkash",
+        "nagad",
+        "rocket",
+      ].includes(paymentMethod);
+      const resolvedPaymentStatus = MANUAL_PAYMENT_STATUSES.includes(
+        paymentStatus,
+      )
+        ? paymentStatus
+        : isCodLike
+          ? "cod"
+          : "unpaid";
+
+      const order = new Order({
+        userId: linkedUserId,
+        userEmail: linkedEmail || null,
+        items: finalItems,
+        billingDetails: {
+          name,
+          phone,
+          email: linkedEmail || null,
+          city,
+          zone,
+          area: billingDetails.area || null,
+          address: billingDetails.address || null,
+          note: String(note ?? billingDetails.note ?? "").trim(),
+        },
+        subtotal,
+        shipping: computedShipping,
+        discount,
+        total,
+        paymentMethod,
+        couponCode: quote.appliedCouponCode || null,
+        appliedCoupons:
+          quote.appliedCoupons?.map((c) => ({
+            code: c.code,
+            discountValue: c.discountValue,
+          })) || [],
+        rewardPointsEarned: quote.rewardPointsEarned || 0,
+        status: initialStatus,
+        paymentStatus: resolvedPaymentStatus,
+      });
+
+      appendStatusHistory(order, {
+        previousStatus: null,
+        newStatus: initialStatus,
+        reason: "Order created manually from the dashboard",
+        changedBy: actorLabel(req.admin),
+      });
+      recordOrderEditor(order, req.admin);
+
+      await order.save();
+
+      // Track coupon usage exactly like the storefront does
+      if (linkedUserId && quote.appliedCoupons?.length) {
+        const Discount = (await import("../models/Discount.js")).default;
+        const CouponUsage = (await import("../models/CouponUsage.js")).default;
+        for (const coupon of quote.appliedCoupons) {
+          try {
+            await CouponUsage.create({
+              userId: linkedUserId,
+              couponId: coupon._id,
+              orderId: order._id,
+            });
+            await Discount.findByIdAndUpdate(coupon._id, {
+              $inc: { usageCount: 1 },
+            });
+          } catch {}
+        }
+      }
+
+      // Clean up the source abandoned cart / checkout so it drops off those
+      // lists. These are awaited (not fire-and-forget) so the records are
+      // committed before we respond — otherwise the row can reappear in the
+      // abandoned tab on the next refresh. Once the order exists, both the
+      // saved cart and any incomplete checkout for this customer are stale, so
+      // we clear both regardless of which tab the order was created from.
+      const cartUserIds = [sourceCartUserId, linkedUserId].filter(Boolean);
+      if (cartUserIds.length) {
+        try {
+          await User.updateMany(
+            { _id: { $in: cartUserIds } },
+            { savedCart: null },
+          );
+        } catch {}
+      }
+
+      const checkoutFilter = { $or: [] };
+      if (sourceCheckoutId) checkoutFilter.$or.push({ _id: sourceCheckoutId });
+      if (linkedUserId)
+        checkoutFilter.$or.push({ userId: linkedUserId, status: "incomplete" });
+      if (checkoutFilter.$or.length) {
+        try {
+          await CheckoutSession.updateMany(checkoutFilter, {
+            status: "completed",
+            completedAt: new Date(),
+          });
+        } catch {}
+      }
+
+      const customerUserId = await resolveCustomerUserId(order);
+      res.status(201).json({
+        ok: true,
+        orderId: order._id.toString(),
+        order: { ...order.toObject(), customerUserId },
+      });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// GET /api/admin/orders/timeline — recent status-change events across all orders
+router.get(
+  "/orders/timeline",
+  requireAdmin,
+  requirePermission("orders"),
+  async (req, res) => {
+    try {
+      const limit = Math.min(parseInt(req.query.limit) || 50, 100);
+      const orders = await Order.find(
+        { "statusHistory.0": { $exists: true } },
+        {
+          _id: 1,
+          orderNumber: 1,
+          "billingDetails.name": 1,
+          "billingDetails.phone": 1,
+          status: 1,
+          total: 1,
+          statusHistory: 1,
+          createdAt: 1,
+        },
+      )
+        .sort({ updatedAt: -1 })
+        .limit(limit)
+        .lean();
+
+      const events = [];
+      for (const order of orders) {
+        for (const ev of order.statusHistory || []) {
+          events.push({
+            orderId: order._id,
+            orderIdShort:
+              order.orderNumber || String(order._id).slice(-8).toUpperCase(),
+            customerName: order.billingDetails?.name || "—",
+            customerPhone: order.billingDetails?.phone || "",
+            orderTotal: order.total,
+            newStatus: ev.newStatus,
+            previousStatus: ev.previousStatus,
+            changedBy: ev.changedBy,
+            reason: ev.reason,
+            at: ev.at,
+          });
+        }
+      }
+      events.sort((a, b) => new Date(b.at) - new Date(a.at));
+      res.json({ events: events.slice(0, limit) });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// GET /api/admin/orders/returns — list orders with status "returned"
+router.get(
+  "/orders/returns",
+  requireAdmin,
+  requirePermission("orders"),
+  async (req, res) => {
+    try {
+      const { page = 1, limit = 20, status, q } = req.query;
+
+      // Base: all orders whose delivery status is "returned" (exclude trashed)
+      const filter = { status: "returned", deletedAt: null };
+
+      // Sub-filter by returnRequest processing status
+      if (status && status !== "all") {
+        if (status === "pending") {
+          // pending = no returnRequest yet, OR returnRequest.status is pending
+          filter.$or = [
+            { returnRequest: null },
+            { returnRequest: { $exists: false } },
+            { "returnRequest.status": "pending" },
+          ];
+        } else {
+          filter["returnRequest.status"] = status;
+        }
+      }
+
+      if (q) {
+        const qFilter = [
+          ...orderIdMatchConditions(q),
+          { "billingDetails.name": { $regex: q, $options: "i" } },
+          { "billingDetails.phone": { $regex: q, $options: "i" } },
+        ];
+        if (filter.$or) {
+          filter.$and = [{ $or: filter.$or }, { $or: qFilter }];
+          delete filter.$or;
+        } else {
+          filter.$or = qFilter;
+        }
+      }
+
+      const skip = (parseInt(page) - 1) * parseInt(limit);
+      const [ordersRaw, total] = await Promise.all([
+        Order.find(filter)
+          .sort({ updatedAt: -1 })
+          .skip(skip)
+          .limit(parseInt(limit))
+          .lean(),
+        Order.countDocuments(filter),
+      ]);
+
+      const orders = await Promise.all(
+        ordersRaw.map(async (order) => ({
+          ...order,
+          orderId: order.orderNumber || formatOrderIdSuffix(order._id),
+          customerUserId: await resolveCustomerUserId(order),
+        })),
+      );
+
+      const [approved, rejected] = await Promise.all([
+        Order.countDocuments({
+          status: "returned",
+          "returnRequest.status": "approved",
+        }),
+        Order.countDocuments({
+          status: "returned",
+          "returnRequest.status": "rejected",
+        }),
+      ]);
+      const pendingCount = await Order.countDocuments({
+        status: "returned",
+        $or: [
+          { returnRequest: null },
+          { returnRequest: { $exists: false } },
+          { "returnRequest.status": "pending" },
+        ],
+      });
+      const refundAgg = await Order.aggregate([
+        { $match: { status: "returned", "returnRequest.status": "approved" } },
+        {
+          $group: { _id: null, total: { $sum: "$returnRequest.refundAmount" } },
+        },
+      ]);
+
+      res.json({
+        orders,
+        total,
+        pages: Math.ceil(total / parseInt(limit)),
+        stats: {
+          pending: pendingCount,
+          approved,
+          rejected,
+          totalRefund: refundAgg[0]?.total || 0,
+        },
+      });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// POST /api/admin/orders/:id/return — create a return request
+router.post(
+  "/orders/:id/return",
+  requireAdmin,
+  requirePermission("orders"),
+  async (req, res) => {
+    try {
+      const { reason } = req.body;
+      if (!reason?.trim())
+        return res.status(400).json({ error: "Reason is required" });
+
+      const order = await Order.findById(req.params.id);
+      if (!order) return res.status(404).json({ error: "Order not found" });
+      if (order.returnRequest)
+        return res
+          .status(409)
+          .json({ error: "A return request already exists for this order" });
+
+      order.returnRequest = {
+        reason: reason.trim(),
+        requestedAt: new Date(),
+        status: "pending",
+        refundAmount: 0,
+        adminNote: "",
+        resolvedAt: null,
+        resolvedBy: "",
+      };
+      await order.save();
+      res.json(order);
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// PUT /api/admin/orders/:id/return — approve or reject a return request
+router.put(
+  "/orders/:id/return",
+  requireAdmin,
+  requirePermission("orders"),
+  async (req, res) => {
+    try {
+      const { status, refundAmount, adminNote } = req.body;
+      if (!["pending", "approved", "rejected"].includes(status)) {
+        return res.status(400).json({ error: "Invalid status" });
+      }
+
+      const order = await Order.findById(req.params.id);
+      if (!order) return res.status(404).json({ error: "Order not found" });
+
+      // Auto-create returnRequest if order is "returned" but has no request yet
+      if (!order.returnRequest) {
+        if (order.status !== "returned")
+          return res
+            .status(404)
+            .json({ error: "No return request found for this order" });
+        order.returnRequest = {
+          reason: "",
+          requestedAt: new Date(),
+          status: "pending",
+          refundAmount: 0,
+          adminNote: "",
+        };
+      }
+
+      const prevStatus = order.returnRequest.status;
+      order.returnRequest.status = status;
+      if (adminNote !== undefined)
+        order.returnRequest.adminNote = adminNote.trim();
+      if (refundAmount !== undefined)
+        order.returnRequest.refundAmount = Math.max(
+          0,
+          Number(refundAmount) || 0,
+        );
+      if (status !== "pending") {
+        order.returnRequest.resolvedAt = new Date();
+        order.returnRequest.resolvedBy =
+          req.admin?.name || req.admin?.email || "admin";
+      }
+
+      if (prevStatus !== status) {
+        const changedBy = actorLabel(req.admin);
+        const note = adminNote?.trim() || "";
+        appendStatusHistory(order, {
+          previousStatus: `return-${prevStatus}`,
+          newStatus: `return-${status}`,
+          reason: note,
+          changedBy,
+        });
+      }
+
+      await order.save();
+      res.json(order);
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// DELETE /api/admin/orders/:id/return — remove a return request
+router.delete(
+  "/orders/:id/return",
+  requireAdmin,
+  requirePermission("orders"),
+  async (req, res) => {
+    try {
+      const order = await Order.findById(req.params.id);
+      if (!order) return res.status(404).json({ error: "Order not found" });
+
+      order.returnRequest = null;
+      await order.save();
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// GET /api/admin/orders/:id
+router.get(
+  "/orders/:id",
+  requireAdmin,
+  requirePermission("orders"),
+  async (req, res) => {
+    try {
+      let order = await Order.findById(req.params.id);
+      if (!order) return res.status(404).json({ error: "Order not found" });
+
+      if (order.shipment?.trackingId || order.shipment?.trackingUrl) {
+        try {
+          const syncResult = await syncOrderShipment(order, { force: false });
+          if (syncResult.ok && syncResult.order) order = syncResult.order;
+        } catch {
+          // sync skipped
+        }
+      }
+
+      const orderObj = order.toObject();
+
+      // Enrich order items with product barcode code for print slip
+      if (orderObj.items?.length) {
+        const pids = [
+          ...new Set(orderObj.items.map((i) => i.productId).filter(Boolean)),
+        ];
+        if (pids.length) {
+          const bpArr = await Product.find({ _id: { $in: pids } })
+            .select("_id barcode")
+            .lean();
+          const bpMap = {};
+          bpArr.forEach((p) => {
+            if (p.barcode) bpMap[p._id.toString()] = p.barcode;
+          });
+          orderObj.items = orderObj.items.map((item) => ({
+            ...item,
+            barcode: bpMap[item.productId] || null,
+          }));
+        }
+      }
+
+      let customerTags = [];
+      if (orderObj.userId) {
+        const user = await User.findById(orderObj.userId)
+          .populate("tags")
+          .lean();
+        customerTags = user?.tags || [];
+      } else if (orderObj.billingDetails?.email || orderObj.userEmail) {
+        const email = orderObj.billingDetails?.email || orderObj.userEmail;
+        const user = await User.findOne({ email }).populate("tags").lean();
+        customerTags = user?.tags || [];
+      }
+
+      await ensureDefaultCouriers();
+      const courierDoc = orderObj.shipment?.courier
+        ? await Courier.findOne({ slug: orderObj.shipment.courier }).lean()
+        : null;
+
+      const customerUserId = await resolveCustomerUserId(orderObj);
+
+      res.json({
+        ...orderObj,
+        orderId: orderObj.orderNumber || formatOrderIdSuffix(orderObj._id),
+        customerTags,
+        customerUserId,
+        courierName: courierDoc?.name || orderObj.shipment?.courier || null,
+      });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// PUT /api/admin/orders/:id/status
+router.put(
+  "/orders/:id/status",
+  requireAdmin,
+  requirePermission("orders"),
+  async (req, res) => {
+    try {
+      const VALID = [
+        "pending",
+        "accepted",
+        "picked",
+        "approved",
+        "rejected",
+        "confirmed",
+        "processing",
+        "shipped",
+        "delivered",
+        "returned",
+        "failed",
+        "cancelled",
+      ];
+      const { status, reason } = req.body;
+      if (!VALID.includes(status))
+        return res.status(400).json({ error: "Invalid status" });
+      // Reason is optional — a status change no longer requires a note.
+      const order = await Order.findById(req.params.id);
+      if (!order) return res.status(404).json({ error: "Order not found" });
+      applyOrderStatusChange(order, status, {
+        reason: String(reason || "").trim(),
+        changedBy: isHiddenAdmin(req.admin)
+          ? "admin"
+          : String(req.admin?._id || "admin"),
+      });
+      recordOrderEditor(order, req.admin);
+      if (status === "delivered") {
+        await creditOrderRewardPoints(order);
+      }
+      await order.save();
+      if (status === "cancelled") {
+        sendOrderCancelledEmail(order, {
+          reason: String(reason || "").trim(),
+          cancelledBy: "admin",
+        }).catch(() => {});
+      }
+      res.json(order);
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// PUT /api/admin/orders/:id/payment-status
+router.put(
+  "/orders/:id/payment-status",
+  requireAdmin,
+  requirePermission("orders"),
+  async (req, res) => {
+    try {
+      const VALID = ["unpaid", "cod", "paid", "failed", "cancelled"];
+      const { paymentStatus, paidAmount } = req.body;
+      if (!VALID.includes(paymentStatus))
+        return res.status(400).json({ error: "Invalid payment status" });
+      const order = await Order.findById(req.params.id);
+      if (!order) return res.status(404).json({ error: "Order not found" });
+      order.paymentStatus = paymentStatus;
+      if (typeof paidAmount !== "undefined") {
+        order.paidAmount = Number(paidAmount) || 0;
+      } else if (paymentStatus === "paid") {
+        order.paidAmount = order.total || 0;
+      }
+      recordOrderEditor(order, req.admin);
+      order.updatedAt = new Date();
+      await order.save();
+      const customerUserId = await resolveCustomerUserId(order);
+      res.json({ ...order.toObject(), customerUserId });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// PUT /api/admin/orders/:id/line-items — update items, shipping, discount; recalc totals
+router.put(
+  "/orders/:id/line-items",
+  requireAdmin,
+  requirePermission("orders"),
+  async (req, res) => {
+    try {
+      const order = await Order.findById(req.params.id);
+      if (!order) return res.status(404).json({ error: "Order not found" });
+
+      const { items, shipping, discount, total, subtotal } = req.body || {};
+
+      if (Array.isArray(items)) {
+        if (items.length === 0) {
+          return res
+            .status(400)
+            .json({ error: "Order must have at least one item." });
+        }
+        order.items = items.map((item) => ({
+          productId: item.productId || null,
+          title: String(item.title || "").trim() || "Item",
+          price: Math.max(0, Number(item.price) || 0),
+          quantity: Math.max(1, Number(item.quantity) || 1),
+          image: item.image || null,
+          color: item.color || null,
+          size: item.size || null,
+          attrGroup: item.attrGroup || null,
+          attrValue: item.attrValue || null,
+          attributes:
+            item.attributes &&
+            typeof item.attributes === "object" &&
+            Object.keys(item.attributes).length
+              ? item.attributes
+              : undefined,
+          rewardPoints: Number(item.rewardPoints) || 0,
+        }));
+        order.subtotal = order.items.reduce(
+          (sum, item) => sum + item.price * item.quantity,
+          0,
+        );
+      } else if (typeof subtotal !== "undefined") {
+        // Direct override of the original order (main) amount when the admin
+        // isn't editing individual line items.
+        order.subtotal = Math.max(0, Number(subtotal) || 0);
+      }
+
+      if (typeof shipping !== "undefined") {
+        order.shipping = Math.max(0, Number(shipping) || 0);
+      }
+      if (typeof discount !== "undefined") {
+        order.discount = Math.max(0, Number(discount) || 0);
+      }
+
+      if (typeof total !== "undefined") {
+        // Explicit override of the final (main) amount the customer pays. When
+        // omitted we recompute it from subtotal + shipping − discount.
+        order.total = Math.max(0, Number(total) || 0);
+      } else {
+        order.total = Math.max(
+          0,
+          (order.subtotal || 0) + (order.shipping || 0) - (order.discount || 0),
+        );
+      }
+      recordOrderEditor(order, req.admin);
+      order.updatedAt = new Date();
+      await order.save();
+      const customerUserId = await resolveCustomerUserId(order);
+      res.json({ ...order.toObject(), customerUserId });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// GET /api/admin/couriers/sync-config — which couriers support API sync (for admin UI)
+router.get("/couriers/sync-config", requireAdmin, async (req, res) => {
+  res.json(await getCourierSyncConfig());
+});
+
+// GET /api/admin/couriers/booking-options — couriers ready for API parcel booking
+router.get("/couriers/booking-options", requireAdmin, async (req, res) => {
+  try {
+    const items = await listBookableCouriers();
+    res.json({ items });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// GET /api/admin/rewards — all users & orders with reward activity
+router.get(
+  "/rewards",
+  requireAdmin,
+  requirePermission("catalog"),
+  async (req, res) => {
+    try {
+      const users = await User.find({ rewardPointsBalance: { $gt: 0 } })
+        .select("name email rewardPointsBalance createdAt")
+        .sort({ rewardPointsBalance: -1 })
+        .limit(200)
+        .lean();
+
+      const orders = await Order.find({
+        $or: [
+          { rewardPointsEarned: { $gt: 0 } },
+          { rewardPointsRedeemed: { $gt: 0 } },
+        ],
+      })
+        .sort({ createdAt: -1 })
+        .limit(300)
+        .lean();
+
+      const orderRows = [];
+      for (const order of orders) {
+        const items = await enrichOrderItemsWithRewardPoints(order.items);
+        orderRows.push({
+          _id: order._id,
+          orderId: order.orderNumber || formatOrderIdSuffix(order._id),
+          userId: order.userId,
+          customerName: order.billingDetails?.name,
+          status: order.status,
+          createdAt: order.createdAt,
+          rewardPointsEarned:
+            order.rewardPointsEarned || calcItemsRewardPoints(items),
+          rewardPointsRedeemed: order.rewardPointsRedeemed || 0,
+          rewardPointsDiscount: order.rewardPointsDiscount || 0,
+          credited: Boolean(order.rewardPointsCredited),
+          items,
+        });
+      }
+
+      const totalBalance = users.reduce(
+        (s, u) => s + (u.rewardPointsBalance || 0),
+        0,
+      );
+      const totalRedeemed = orderRows.reduce(
+        (s, o) => s + (o.rewardPointsRedeemed || 0),
+        0,
+      );
+      const totalEarned = orderRows.reduce(
+        (s, o) => s + (o.rewardPointsEarned || 0),
+        0,
+      );
+
+      res.json({
+        pointsPerTk: POINTS_PER_TK,
+        stats: {
+          usersWithBalance: users.length,
+          totalBalance,
+          totalBalanceTk: pointsToTk(totalBalance),
+          totalEarned,
+          totalRedeemed,
+          ordersWithRewards: orderRows.length,
+        },
+        users,
+        orders: orderRows,
+      });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// PUT /api/admin/orders/:id/pick — pick toggle only assigns/clears the picker
+// (order status is never changed automatically; that stays a manual action)
+router.put(
+  "/orders/:id/pick",
+  requireAdmin,
+  requirePermission("orders"),
+  async (req, res) => {
+    try {
+      const { pick } = req.body || {};
+      const order = await Order.findById(req.params.id);
+      if (!order) return res.status(404).json({ error: "Order not found" });
+
+      // Hidden super-admin shows as the neutral "admin" rather than its name.
+      const adminName = actorLabel(req.admin);
+      if (pick) {
+        // Picking only assigns the picker — it must NOT change the order status.
+        // The status stays whatever it is until an admin/moderator changes it
+        // manually (PUT /api/admin/orders/:id/status), which records changedBy.
+        if (order.pickedBy?.adminId) {
+          if (order.pickedBy.adminId.toString() !== req.admin._id.toString()) {
+            return res
+              .status(400)
+              .json({ error: `Already picked by ${order.pickedBy.name}` });
+          }
+          // Same picker re-picking — no-op.
+        } else {
+          order.pickedBy = {
+            adminId: req.admin._id,
+            name: adminName,
+            pickedAt: new Date(),
+          };
+        }
+      } else {
+        if (
+          order.pickedBy?.adminId &&
+          order.pickedBy.adminId.toString() !== req.admin._id.toString() &&
+          req.admin.role !== "admin"
+        ) {
+          return res
+            .status(403)
+            .json({ error: "Only the picker or an admin can unpick" });
+        }
+        // Unpicking only clears the picker — it must NOT change the order status.
+        order.pickedBy = null;
+      }
+
+      order.updatedAt = new Date();
+      await order.save();
+      res.json({
+        ...order.toObject(),
+        orderId: order.orderNumber || formatOrderIdSuffix(order._id),
+      });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// GET /api/admin/admins/:id/pick-profile — orders picked by this authorized person
+router.get("/admins/:id/pick-profile", requireAdmin, async (req, res) => {
+  try {
+    if (req.admin.role !== "admin")
+      return res.status(403).json({ error: "Admin access required" });
+    const person = await Admin.findById(req.params.id).select(
+      "-hashedPassword",
+    );
+    if (!person) return res.status(404).json({ error: "Not found" });
+
+    const ordersRaw = await Order.find({ "pickedBy.adminId": person._id })
+      .sort({ "pickedBy.pickedAt": -1, createdAt: -1 })
+      .limit(200)
+      .lean();
+
+    const orders = ordersRaw.map((o) => ({
+      ...o,
+      orderId: o.orderNumber || formatOrderIdSuffix(o._id),
+    }));
+
+    res.json({
+      person,
+      orders,
+      stats: { total: orders.length },
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// PUT /api/admin/orders/:id/customer — update order customer info and sync user profile/address
+router.put(
+  "/orders/:id/customer",
+  requireAdmin,
+  requirePermission("orders"),
+  async (req, res) => {
+    try {
+      const order = await Order.findById(req.params.id);
+      if (!order) return res.status(404).json({ error: "Order not found" });
+
+      const patch = req.body || {};
+      const current =
+        order.billingDetails?.toObject?.() || order.billingDetails || {};
+      const nextBilling = {
+        ...current,
+        name:
+          typeof patch.name !== "undefined"
+            ? String(patch.name || "").trim()
+            : current.name,
+        phone:
+          typeof patch.phone !== "undefined"
+            ? String(patch.phone || "").trim()
+            : current.phone,
+        email:
+          typeof patch.email !== "undefined"
+            ? String(patch.email || "")
+                .trim()
+                .toLowerCase()
+            : current.email,
+        city:
+          typeof patch.city !== "undefined"
+            ? String(patch.city || "").trim()
+            : current.city,
+        zone:
+          typeof patch.zone !== "undefined"
+            ? String(patch.zone || "").trim()
+            : current.zone,
+        area:
+          typeof patch.area !== "undefined"
+            ? String(patch.area || "").trim()
+            : current.area,
+        address:
+          typeof patch.address !== "undefined"
+            ? String(patch.address || "").trim()
+            : current.address,
+        note:
+          typeof patch.note !== "undefined"
+            ? String(patch.note || "").trim()
+            : current.note,
+      };
+
+      if (!nextBilling.name || !nextBilling.phone) {
+        return res.status(400).json({ error: "Name and phone are required." });
+      }
+
+      order.billingDetails = nextBilling;
+      order.userEmail = nextBilling.email || order.userEmail || null;
+      recordOrderEditor(order, req.admin);
+      order.updatedAt = new Date();
+      await order.save();
+
+      const shouldSyncUser = patch.syncUser !== false;
+      if (shouldSyncUser) {
+        let user = null;
+        if (order.userId) user = await User.findById(order.userId);
+        if (!user && nextBilling.email) {
+          user = await User.findOne({ email: nextBilling.email });
+        }
+        if (!user && nextBilling.phone) {
+          user = await User.findOne({ mobile: nextBilling.phone });
+        }
+
+        if (user) {
+          if (nextBilling.email && nextBilling.email !== user.email) {
+            const duplicate = await User.findOne({ email: nextBilling.email })
+              .select("_id")
+              .lean();
+            if (duplicate && String(duplicate._id) !== String(user._id)) {
+              return res.status(400).json({
+                error: "Cannot sync email: another user already uses it.",
+              });
+            }
+            user.email = nextBilling.email;
+          }
+          user.name = nextBilling.name;
+          user.mobile = nextBilling.phone;
+
+          const addressLine = [nextBilling.address, nextBilling.area]
+            .filter(Boolean)
+            .join(", ")
+            .trim();
+          if (user.addresses?.length) {
+            const addr = user.addresses[0];
+            addr.fullName = nextBilling.name;
+            addr.email = nextBilling.email || user.email || "";
+            addr.phone = nextBilling.phone;
+            addr.city = nextBilling.city || "";
+            addr.zone = nextBilling.zone || "";
+            addr.address = addressLine || nextBilling.address || "";
+          } else {
+            user.addresses = [
+              {
+                fullName: nextBilling.name,
+                email: nextBilling.email || user.email || "",
+                phone: nextBilling.phone,
+                city: nextBilling.city || "",
+                zone: nextBilling.zone || "",
+                address: addressLine || nextBilling.address || "",
+                type: "Home",
+              },
+            ];
+          }
+
+          await user.save();
+          if (!order.userId) {
+            order.userId = String(user._id);
+            await order.save();
+          }
+        }
+      }
+
+      const customerUserId = await resolveCustomerUserId(order);
+      res.json({ ...order.toObject(), customerUserId });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// --- Courier management -------------------------------------------------------
+router.get("/couriers", requireAdmin, async (req, res) => {
+  try {
+    await ensureDefaultCouriers();
+    const items = await Courier.find({}).sort({ sortOrder: 1, name: 1 });
+    res.json({ items });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+router.post("/couriers", requireAdmin, async (req, res) => {
+  try {
+    const { name, slug, trackingUrlTemplate, sortOrder } = req.body || {};
+    if (!name || !String(name).trim()) {
+      return res.status(400).json({ error: "Courier name is required" });
+    }
+    const resolvedSlug =
+      (slug && String(slug).trim().toLowerCase()) ||
+      String(name).trim().toLowerCase().replace(/\s+/g, "_");
+    const courier = await Courier.create({
+      name: String(name).trim(),
+      slug: resolvedSlug,
+      trackingUrlTemplate: trackingUrlTemplate || "",
+      sortOrder: Number.isFinite(Number(sortOrder)) ? Number(sortOrder) : 50,
+      isSystem: false,
+    });
+    res.status(201).json({ courier });
+  } catch (err) {
+    res.status(500).json({
+      error:
+        err.code === 11000 ? "Courier slug already exists" : "Server error",
+    });
+  }
+});
+
+router.put("/couriers/:id", requireAdmin, async (req, res) => {
+  try {
+    const { name, slug, trackingUrlTemplate, sortOrder } = req.body || {};
+    const courier = await Courier.findById(req.params.id);
+    if (!courier) return res.status(404).json({ error: "Not found" });
+    if (typeof name !== "undefined") courier.name = String(name).trim();
+    if (typeof slug !== "undefined" && !courier.isSystem) {
+      courier.slug = String(slug).trim().toLowerCase();
+    }
+    if (typeof trackingUrlTemplate !== "undefined") {
+      courier.trackingUrlTemplate = trackingUrlTemplate || "";
+    }
+    if (typeof sortOrder !== "undefined")
+      courier.sortOrder = Number(sortOrder) || 0;
+    await courier.save();
+    res.json({ ok: true, courier });
+  } catch (err) {
+    res.status(500).json({
+      error:
+        err.code === 11000 ? "Courier slug already exists" : "Server error",
+    });
+  }
+});
+
+router.delete("/couriers/:id", requireAdmin, async (req, res) => {
+  try {
+    const courier = await Courier.findById(req.params.id);
+    if (!courier) return res.status(404).json({ error: "Not found" });
+    await Courier.deleteOne({ _id: courier._id });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// GET /api/admin/couriers/:id/integration — masked courier API credentials
+router.get("/couriers/:id/integration", requireAdmin, async (req, res) => {
+  try {
+    const courier = await Courier.findById(req.params.id).lean();
+    if (!courier) return res.status(404).json({ error: "Not found" });
+
+    const integration = await getCourierIntegration(courier.slug);
+    res.json({
+      courier: {
+        _id: courier._id,
+        name: courier.name,
+        slug: courier.slug,
+        apiEnabled: courier.apiEnabled,
+        storeConfig: courier.storeConfig || {},
+        capabilities: courier.capabilities || {},
+        integrationStatus: courier.integrationStatus || null,
+      },
+      configured: integration.configured,
+      credentialSource: integration.source,
+      credentials: isIntegrationSlug(courier.slug)
+        ? maskCredentialsForSlug(courier.slug, integration.creds || {})
+        : {},
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// PUT /api/admin/couriers/:id/integration — save encrypted credentials
+router.put("/couriers/:id/integration", requireAdmin, async (req, res) => {
+  try {
+    if (req.admin.role !== "admin") {
+      return res.status(403).json({ error: "Admin access required" });
+    }
+    const { apiEnabled, credentials, storeConfig, capabilities } =
+      req.body || {};
+    const courier = await saveCourierCredentials(req.params.id, {
+      apiEnabled,
+      credentials,
+      storeConfig,
+      capabilities,
+    });
+    if (!courier) return res.status(404).json({ error: "Not found" });
+
+    const integration = await getCourierIntegration(courier.slug);
+    res.json({
+      ok: true,
+      configured: integration.configured,
+      courier: {
+        _id: courier._id,
+        slug: courier.slug,
+        apiEnabled: courier.apiEnabled,
+        storeConfig: courier.storeConfig,
+        capabilities: courier.capabilities,
+      },
+      credentials: maskCredentialsForSlug(
+        courier.slug,
+        integration.creds || {},
+      ),
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// POST /api/admin/couriers/:id/test-connection
+router.post("/couriers/:id/test-connection", requireAdmin, async (req, res) => {
+  try {
+    const courier = await Courier.findById(req.params.id);
+    if (!courier) return res.status(404).json({ error: "Not found" });
+    if (!isIntegrationSlug(courier.slug)) {
+      return res
+        .status(400)
+        .json({ error: "This courier does not support API integration" });
+    }
+
+    const integration = await getCourierIntegration(courier.slug);
+    if (!integration.creds) {
+      return res.status(400).json({ error: "Credentials not configured" });
+    }
+
+    const result = await testCourierConnection(
+      courier.slug,
+      integration.creds,
+      integration.storeConfig,
+    );
+
+    courier.integrationStatus = {
+      lastTestedAt: new Date(),
+      lastTestOk: true,
+      lastTestMessage: result.message || "Connected",
+    };
+    await courier.save();
+
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    try {
+      const courier = await Courier.findById(req.params.id);
+      if (courier) {
+        courier.integrationStatus = {
+          lastTestedAt: new Date(),
+          lastTestOk: false,
+          lastTestMessage: err.message || "Connection failed",
+        };
+        await courier.save();
+      }
+    } catch {
+      /* ignore */
+    }
+    res.status(502).json({ error: err.message || "Connection test failed" });
+  }
+});
+
+// GET /api/admin/couriers/:id/redx-areas — helper for RedX delivery area setup
+router.get("/couriers/:id/redx-areas", requireAdmin, async (req, res) => {
+  try {
+    const courier = await Courier.findById(req.params.id).lean();
+    if (!courier || courier.slug !== "redx") {
+      return res.status(400).json({ error: "RedX courier required" });
+    }
+    const integration = await getCourierIntegration("redx");
+    if (!integration.creds) {
+      return res.status(400).json({ error: "RedX credentials not configured" });
+    }
+    const areas = await fetchRedxAreas(
+      integration.creds,
+      integration.storeConfig,
+      {
+        districtName: req.query.district || req.query.district_name,
+      },
+    );
+    res.json({ items: areas });
+  } catch (err) {
+    res.status(502).json({ error: err.message || "Failed to load areas" });
+  }
+});
+
+// GET /api/admin/shipment-config — shop pickup + defaults
+router.get("/shipment-config", requireAdmin, async (req, res) => {
+  try {
+    const Setting = (await import("../models/Setting.js")).default;
+    let settings = await Setting.findOne().lean();
+    if (!settings) settings = {};
+    res.json({ shipmentConfig: settings.shipmentConfig || {} });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// PUT /api/admin/shipment-config
+router.put("/shipment-config", requireAdmin, async (req, res) => {
+  try {
+    if (req.admin.role !== "admin") {
+      return res.status(403).json({ error: "Admin access required" });
+    }
+    const { shipmentConfig } = req.body || {};
+    const Setting = (await import("../models/Setting.js")).default;
+    const settings = await Setting.findOneAndUpdate(
+      {},
+      { $set: { shipmentConfig: shipmentConfig || {} } },
+      { upsert: true, new: true },
+    );
+    res.json({ ok: true, shipmentConfig: settings.shipmentConfig });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// --- Timeline preset management -----------------------------------------------
+router.get("/timeline-presets", requireAdmin, async (req, res) => {
+  try {
+    const items = await TimelinePreset.find({}).sort({
+      sortOrder: 1,
+      label: 1,
+    });
+    res.json({ items });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+router.post("/timeline-presets", requireAdmin, async (req, res) => {
+  try {
+    const { label, statusKey, sortOrder } = req.body || {};
+    if (!label || !String(label).trim()) {
+      return res.status(400).json({ error: "Preset label is required" });
+    }
+    const resolvedKey =
+      (statusKey && String(statusKey).trim().toLowerCase()) ||
+      String(label).trim().toLowerCase().replace(/\s+/g, "_");
+    const preset = await TimelinePreset.create({
+      label: String(label).trim(),
+      statusKey: resolvedKey,
+      sortOrder: Number.isFinite(Number(sortOrder)) ? Number(sortOrder) : 50,
+    });
+    res.status(201).json({ preset });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+router.put("/timeline-presets/:id", requireAdmin, async (req, res) => {
+  try {
+    const { label, statusKey, sortOrder } = req.body || {};
+    const preset = await TimelinePreset.findById(req.params.id);
+    if (!preset) return res.status(404).json({ error: "Not found" });
+    if (typeof label !== "undefined") preset.label = String(label).trim();
+    if (typeof statusKey !== "undefined")
+      preset.statusKey = String(statusKey).trim().toLowerCase();
+    if (typeof sortOrder !== "undefined")
+      preset.sortOrder = Number(sortOrder) || 0;
+    await preset.save();
+    res.json({ ok: true, preset });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+router.delete("/timeline-presets/:id", requireAdmin, async (req, res) => {
+  try {
+    const preset = await TimelinePreset.findById(req.params.id);
+    if (!preset) return res.status(404).json({ error: "Not found" });
+    await TimelinePreset.deleteOne({ _id: preset._id });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// PUT /api/admin/orders/:id/shipment — assign courier + tracking, mark handed over
+router.put(
+  "/orders/:id/shipment",
+  requireAdmin,
+  requirePermission("orders"),
+  async (req, res) => {
+    try {
+      const {
+        courier,
+        trackingId,
+        trackingUrl,
+        markHandedOver = true,
+      } = req.body || {};
+      const order = await Order.findById(req.params.id);
+      if (!order) return res.status(404).json({ error: "Order not found" });
+
+      if (courier && !(await isValidCourierSlug(courier))) {
+        return res.status(400).json({ error: "Invalid courier" });
+      }
+
+      if (!order.shipment) order.shipment = { trackingEvents: [] };
+
+      if (courier !== undefined) order.shipment.courier = courier || null;
+      if (trackingId !== undefined)
+        order.shipment.trackingId = trackingId
+          ? String(trackingId).trim()
+          : null;
+
+      if (trackingUrl !== undefined) {
+        order.shipment.trackingUrl = trackingUrl
+          ? String(trackingUrl).trim()
+          : null;
+      } else if (trackingId && order.shipment.courier) {
+        await ensureDefaultCouriers();
+        const courierDoc = await Courier.findOne({
+          slug: order.shipment.courier,
+        }).lean();
+        order.shipment.trackingUrl =
+          buildTrackingUrl(
+            courierDoc?.trackingUrlTemplate,
+            order.shipment.trackingId,
+          ) ||
+          defaultTrackingUrl(
+            order.shipment.courier,
+            order.shipment.trackingId,
+          ) ||
+          order.shipment.trackingUrl;
+      }
+
+      const hasCourierRef = Boolean(
+        order.shipment.courier && order.shipment.trackingId,
+      );
+      const hasTrackingLink = Boolean(order.shipment.trackingUrl);
+      const shouldHandOver =
+        markHandedOver &&
+        !order.shipment.handedToCourierAt &&
+        (hasCourierRef || hasTrackingLink);
+
+      if (shouldHandOver) {
+        order.shipment.handedToCourierAt = new Date();
+        if (["confirmed", "processing"].includes(order.status)) {
+          order.status = "shipped";
+        }
+      }
+
+      order.updatedAt = new Date();
+      await order.save();
+
+      try {
+        const syncResult = await syncOrderShipment(order, { force: true });
+        if (syncResult.ok && syncResult.order) {
+          return res.json(syncResult.order);
+        }
+      } catch {
+        // sync failed; return saved order
+      }
+
+      res.json(order);
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// POST /api/admin/orders/:id/shipment/events — manual tracking line (no courier API)
+router.post(
+  "/orders/:id/shipment/events",
+  requireAdmin,
+  requirePermission("orders"),
+  async (req, res) => {
+    try {
+      const { status, message } = req.body || {};
+      const label = message || status;
+      if (!label || !String(label).trim()) {
+        return res
+          .status(400)
+          .json({ error: "Event message or status is required." });
+      }
+      const order = await Order.findById(req.params.id);
+      if (!order) return res.status(404).json({ error: "Order not found" });
+      const normalizedStatus = status
+        ? String(status).trim().toLowerCase()
+        : "";
+      const isDelivered =
+        normalizedStatus === "delivered" ||
+        /^delivered$/i.test(String(label).trim());
+
+      if (isDelivered) {
+        applyOrderStatusChange(order, "delivered", {
+          reason: String(label).trim(),
+          changedBy: String(req.admin?._id || "admin"),
+        });
+      } else {
+        appendManualTrackingEvent(order, {
+          status: normalizedStatus || "update",
+          message: String(label).trim(),
+        });
+      }
+      order.updatedAt = new Date();
+      await order.save();
+      res.json(order);
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// PUT /api/admin/orders/:id/shipment/events/:index — edit manual tracking event
+router.put(
+  "/orders/:id/shipment/events/:index",
+  requireAdmin,
+  requirePermission("orders"),
+  async (req, res) => {
+    try {
+      const index = parseInt(req.params.index, 10);
+      const { status, message } = req.body || {};
+      const order = await Order.findById(req.params.id);
+      if (!order) return res.status(404).json({ error: "Order not found" });
+      const events = order.shipment?.trackingEvents || [];
+      if (index < 0 || index >= events.length) {
+        return res.status(404).json({ error: "Tracking event not found" });
+      }
+      if (status) events[index].status = String(status).trim();
+      if (message) events[index].message = String(message).trim();
+      order.shipment.trackingEvents = events;
+      order.updatedAt = new Date();
+      await order.save();
+      res.json(order);
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// DELETE /api/admin/orders/:id/shipment/events/:index — remove tracking event
+router.delete(
+  "/orders/:id/shipment/events/:index",
+  requireAdmin,
+  requirePermission("orders"),
+  async (req, res) => {
+    try {
+      const index = parseInt(req.params.index, 10);
+      const order = await Order.findById(req.params.id);
+      if (!order) return res.status(404).json({ error: "Order not found" });
+      const events = order.shipment?.trackingEvents || [];
+      if (index < 0 || index >= events.length) {
+        return res.status(404).json({ error: "Tracking event not found" });
+      }
+      events.splice(index, 1);
+      order.shipment.trackingEvents = events;
+      order.updatedAt = new Date();
+      await order.save();
+      res.json(order);
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// POST /api/admin/orders/:id/book-courier — create parcel via courier API
+router.post(
+  "/orders/:id/book-courier",
+  requireAdmin,
+  requirePermission("orders"),
+  async (req, res) => {
+    try {
+      const {
+        courier,
+        weight,
+        codAmount,
+        note,
+        deliveryAreaId,
+        deliveryAreaName,
+        itemQuantity,
+      } = req.body || {};
+      if (!courier) {
+        return res.status(400).json({ error: "Courier is required" });
+      }
+
+      const order = await Order.findById(req.params.id);
+      if (!order) return res.status(404).json({ error: "Order not found" });
+
+      const result = await bookParcelWithCourier(order, courier, {
+        weight,
+        codAmount,
+        note,
+        deliveryAreaId,
+        deliveryAreaName,
+        itemQuantity,
+      });
+
+      if (!result.ok) {
+        return res.status(400).json({
+          error: result.error,
+          code: result.code || "book_failed",
+        });
+      }
+
+      if (!order.shipment) order.shipment = { trackingEvents: [] };
+      order.shipment.courier = result.courier;
+      order.shipment.trackingId = result.consignmentId;
+      order.shipment.trackingUrl = result.trackingUrl;
+      order.shipment.bookedAt = new Date();
+      order.shipment.bookingSource = "api";
+      order.shipment.handedToCourierAt =
+        order.shipment.handedToCourierAt || new Date();
+      order.shipment.courierStatus = "Booked";
+
+      const courierLabel =
+        result.courier.charAt(0).toUpperCase() + result.courier.slice(1);
+
+      const Setting = (await import("../models/Setting.js")).default;
+      const settings = await Setting.findOne().lean();
+      const nextStatus = settings?.shipmentConfig?.bookSetsStatus || "shipped";
+      if (
+        ["confirmed", "processing", "accepted", "picked", "approved"].includes(
+          order.status,
+        )
+      ) {
+        applyOrderStatusChange(order, nextStatus, {
+          reason: `Booked with ${courierLabel}`,
+          changedBy: isHiddenAdmin(req.admin)
+            ? "admin"
+            : req.admin?.name || String(req.admin?._id || "admin"),
+        });
+      }
+
+      order.updatedAt = new Date();
+      await order.save();
+
+      try {
+        const syncResult = await syncOrderShipment(order, { force: true });
+        if (syncResult.ok && syncResult.order) {
+          return res.json(syncResult.order);
+        }
+      } catch {
+        // sync failed; return saved order
+      }
+
+      res.json(order);
+    } catch (err) {
+      res.status(400).json({
+        error: err.message || "Courier booking failed",
+        code: "courier_api_error",
+      });
+    }
+  },
+);
+
+// POST /api/admin/orders/:id/shipment/sync — pull latest status from courier API
+router.post(
+  "/orders/:id/shipment/sync",
+  requireAdmin,
+  requirePermission("orders"),
+  async (req, res) => {
+    try {
+      const order = await Order.findById(req.params.id);
+      if (!order) return res.status(404).json({ error: "Order not found" });
+      if (!order.shipment?.courier || !order.shipment?.trackingId) {
+        return res
+          .status(400)
+          .json({ error: "Courier and tracking ID are required." });
+      }
+
+      if (!(await isCourierSyncConfigured(order.shipment.courier))) {
+        return res.status(400).json({
+          error:
+            "Courier API sync is not configured. Update order status manually or add a tracking link for the customer.",
+          code: "courier_api_not_configured",
+        });
+      }
+
+      const result = await syncOrderShipment(order, { force: true });
+      if (!result.ok) {
+        const message =
+          result.reason === "courier_api_not_configured"
+            ? "Courier API sync is not configured. Update order status manually or add a tracking link for the customer."
+            : result.reason || "Could not sync shipment.";
+        return res.status(400).json({ error: message, code: result.reason });
+      }
+      res.json(result.order);
+    } catch (err) {
+      res.status(502).json({ error: err.message || "Courier sync failed." });
+    }
+  },
+);
+
+// DELETE /api/admin/orders/:id — move to trash (recoverable); ?force=true purges
+router.delete(
+  "/orders/:id",
+  requireAdmin,
+  requirePermission("orders"),
+  async (req, res) => {
+    try {
+      const force = req.query.force === "true" || req.query.force === "1";
+      if (force) {
+        const order = await Order.findByIdAndDelete(req.params.id);
+        if (!order) return res.status(404).json({ error: "Order not found" });
+        return res.json({ ok: true });
+      }
+      const order = await Order.findByIdAndUpdate(
+        req.params.id,
+        { deletedAt: new Date(), deletedBy: req.admin._id },
+        { new: true },
+      );
+      if (!order) return res.status(404).json({ error: "Order not found" });
+      res.json({ ok: true, order });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// --- Orders recycle bin (bulk) --------------------------------------------
+// Validate a `{ ids: [...] }` body into a clean array of ObjectId strings.
+const parseOrderIds = (body) => {
+  const raw = Array.isArray(body?.ids) ? body.ids : [];
+  return raw
+    .map((id) => String(id || "").trim())
+    .filter((id) => mongoose.Types.ObjectId.isValid(id));
+};
+
+// POST /api/admin/orders/trash — bulk move orders to trash
+router.post(
+  "/orders/trash",
+  requireAdmin,
+  requirePermission("orders"),
+  async (req, res) => {
+    try {
+      const ids = parseOrderIds(req.body);
+      if (ids.length === 0)
+        return res.status(400).json({ error: "No valid order ids provided" });
+      const result = await Order.updateMany(
+        { _id: { $in: ids }, deletedAt: null },
+        { $set: { deletedAt: new Date(), deletedBy: req.admin._id } },
+      );
+      res.json({ ok: true, trashed: result.modifiedCount });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// POST /api/admin/orders/restore — bulk restore orders from trash
+router.post(
+  "/orders/restore",
+  requireAdmin,
+  requirePermission("orders"),
+  async (req, res) => {
+    try {
+      const ids = parseOrderIds(req.body);
+      if (ids.length === 0)
+        return res.status(400).json({ error: "No valid order ids provided" });
+      const result = await Order.updateMany(
+        { _id: { $in: ids }, deletedAt: { $ne: null } },
+        { $set: { deletedAt: null }, $unset: { deletedBy: "" } },
+      );
+      res.json({ ok: true, restored: result.modifiedCount });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// POST /api/admin/orders/permanent-delete — bulk permanent delete (trash only)
+router.post(
+  "/orders/permanent-delete",
+  requireAdmin,
+  requirePermission("orders"),
+  async (req, res) => {
+    try {
+      const ids = parseOrderIds(req.body);
+      if (ids.length === 0)
+        return res.status(400).json({ error: "No valid order ids provided" });
+      const result = await Order.deleteMany({
+        _id: { $in: ids },
+        deletedAt: { $ne: null },
+      });
+      res.json({ ok: true, deleted: result.deletedCount });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// ── Abandoned Carts ──────────────────────────────────────────────────────────
+
+// GET /api/admin/abandoned-carts — users with non-empty saved cart (5+ min old)
+router.get(
+  "/abandoned-carts",
+  requireAdmin,
+  requirePermission("orders"),
+  async (req, res) => {
+    try {
+      const { page = 1, limit = 20, q } = req.query;
+      const pg = Math.max(1, parseInt(page));
+      const lim = Math.min(100, Math.max(1, parseInt(limit)));
+      const lowerBound = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000); // last 30 days
+      const filter = {
+        "savedCart.items.0": { $exists: true },
+        "savedCart.updatedAt": { $gte: lowerBound },
+      };
+      if (q) {
+        filter.$or = [
+          { name: { $regex: q, $options: "i" } },
+          { email: { $regex: q, $options: "i" } },
+          { mobile: { $regex: q, $options: "i" } },
+        ];
+      }
+      const skip = (pg - 1) * lim;
+      const [users, total] = await Promise.all([
+        User.find(filter)
+          .select("name email mobile savedCart addresses")
+          .sort({ "savedCart.updatedAt": -1 })
+          .skip(skip)
+          .limit(lim)
+          .lean(),
+        User.countDocuments(filter),
+      ]);
+      res.json({ users, total, pages: Math.ceil(total / lim) });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// DELETE /api/admin/abandoned-carts/:userId/clear — clear a user's saved cart
+router.delete(
+  "/abandoned-carts/:userId/clear",
+  requireAdmin,
+  requirePermission("orders"),
+  async (req, res) => {
+    try {
+      await User.findByIdAndUpdate(req.params.userId, { savedCart: null });
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// ── Abandoned Checkouts ──────────────────────────────────────────────────────
+
+// GET /api/admin/abandoned-checkouts — incomplete checkout sessions from the last 30 days
+router.get(
+  "/abandoned-checkouts",
+  requireAdmin,
+  requirePermission("orders"),
+  async (req, res) => {
+    try {
+      const { page = 1, limit = 20, q } = req.query;
+      const pg = Math.max(1, parseInt(page));
+      const lim = Math.min(100, Math.max(1, parseInt(limit)));
+      const lowerBound = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000); // last 30 days
+      const filter = { status: "incomplete", createdAt: { $gte: lowerBound } };
+      if (q) {
+        filter.$or = [
+          { userName: { $regex: q, $options: "i" } },
+          { userEmail: { $regex: q, $options: "i" } },
+          { userPhone: { $regex: q, $options: "i" } },
+        ];
+      }
+      const skip = (pg - 1) * lim;
+      const [rawSessions, total] = await Promise.all([
+        CheckoutSession.find(filter)
+          .sort({ createdAt: -1 })
+          .skip(skip)
+          .limit(lim)
+          .lean(),
+        CheckoutSession.countDocuments(filter),
+      ]);
+      // Enrich sessions that have a userId with user details
+      const userIds = [
+        ...new Set(rawSessions.map((s) => s.userId).filter(Boolean)),
+      ];
+      let userMap = {};
+      if (userIds.length) {
+        const users = await User.find({ _id: { $in: userIds } })
+          .select("name email mobile")
+          .lean();
+        for (const u of users) userMap[String(u._id)] = u;
+      }
+      const sessions = rawSessions.map((s) => {
+        const u = s.userId ? userMap[String(s.userId)] : null;
+        return {
+          ...s,
+          userName: s.userName || u?.name || null,
+          userEmail: s.userEmail || u?.email || null,
+          userPhone: s.userPhone || u?.mobile || null,
+        };
+      });
+      res.json({ sessions, total, pages: Math.ceil(total / lim) });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// POST /api/admin/abandoned-checkouts/bulk-delete — remove many session records at once
+router.post(
+  "/abandoned-checkouts/bulk-delete",
+  requireAdmin,
+  requirePermission("orders"),
+  async (req, res) => {
+    try {
+      const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
+      if (!ids.length) return res.status(400).json({ error: "No ids provided" });
+      const result = await CheckoutSession.deleteMany({ _id: { $in: ids } });
+      res.json({ ok: true, deleted: result.deletedCount || 0 });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// DELETE /api/admin/abandoned-checkouts/:id — remove a checkout session record
+router.delete(
+  "/abandoned-checkouts/:id",
+  requireAdmin,
+  requirePermission("orders"),
+  async (req, res) => {
+    try {
+      await CheckoutSession.findByIdAndDelete(req.params.id);
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// ── All Wishlists ────────────────────────────────────────────────────────────
+
+// GET /api/admin/wishlists — products ranked by wishlist count
+router.get(
+  "/wishlists",
+  requireAdmin,
+  requirePermission("orders"),
+  async (req, res) => {
+    try {
+      const { page = 1, limit = 20 } = req.query;
+      const pg = Math.max(1, parseInt(page));
+      const lim = Math.min(100, Math.max(1, parseInt(limit)));
+
+      // Aggregate all wishlist entries across users
+      const allItems = await User.aggregate([
+        { $match: { "wishlist.0": { $exists: true } } },
+        { $unwind: "$wishlist" },
+        {
+          $group: {
+            _id: "$wishlist",
+            count: { $sum: 1 },
+            customers: {
+              $push: {
+                id: "$_id",
+                name: "$name",
+                email: "$email",
+                mobile: "$mobile",
+              },
+            },
+          },
+        },
+        { $sort: { count: -1 } },
+      ]);
+
+      const total = allItems.length;
+      const pageItems = allItems.slice((pg - 1) * lim, pg * lim);
+
+      // Enrich with product details
+      const rawIds = pageItems.map((a) => a._id).filter(Boolean);
+      const objectIds = rawIds
+        .map((id) => {
+          try {
+            return new mongoose.Types.ObjectId(id);
+          } catch {
+            return null;
+          }
+        })
+        .filter(Boolean);
+
+      const products = objectIds.length
+        ? await Product.find({ _id: { $in: objectIds } })
+            .select("title images price status")
+            .lean()
+        : [];
+      const productMap = {};
+      for (const p of products) productMap[String(p._id)] = p;
+
+      const items = pageItems.map((a) => ({
+        productId: a._id,
+        product: productMap[String(a._id)] || null,
+        count: a.count,
+        customers: a.customers.slice(0, 10),
+      }));
+
+      res.json({ items, total, pages: Math.ceil(total / lim) });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// DELETE /api/admin/wishlists/:productId — remove product from ALL users' wishlists
+router.delete(
+  "/wishlists/:productId",
+  requireAdmin,
+  requirePermission("orders"),
+  async (req, res) => {
+    try {
+      const { productId } = req.params;
+      await User.updateMany(
+        { wishlist: productId },
+        { $pull: { wishlist: productId } },
+      );
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// DELETE /api/admin/wishlists/:productId/users/:userId — remove one user's wishlist entry
+router.delete(
+  "/wishlists/:productId/users/:userId",
+  requireAdmin,
+  requirePermission("orders"),
+  async (req, res) => {
+    try {
+      const { productId, userId } = req.params;
+      await User.findByIdAndUpdate(userId, { $pull: { wishlist: productId } });
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: "Server error" });
+    }
+  },
+);
+
+// ─── Migrate Cloudinary folder + all DB image references ─────────────────────
+// POST /api/admin/migrate-cloudinary-folder
+// Body: { from?: "SmartBuyBD", to?: "AppleBD" }
+// Renames every Cloudinary asset under `from/` to `to/` (keeping sub-paths),
+// then updates every image URL / public_id in all MongoDB collections.
+router.post("/migrate-cloudinary-folder", requireAdmin, async (req, res) => {
+  const { from = "SmartBuyBD", to = "AppleBD" } = req.body || {};
+  if (!from || !to || from === to) {
+    return res
+      .status(400)
+      .json({ error: "Provide different from/to folder names" });
+  }
+
+  const log = { cloudinary: { renamed: 0, skipped: 0, errors: [] }, db: {} };
+
+  // Recursively replace every occurrence of `from` with `to` in any JS value
+  const rep = (v) => {
+    if (typeof v === "string") return v.replaceAll(from, to);
+    if (Array.isArray(v)) return v.map(rep);
+    if (v && typeof v === "object") {
+      const o = {};
+      for (const [k, iv] of Object.entries(v)) o[k] = rep(iv);
+      return o;
+    }
+    return v;
+  };
+
+  try {
+    // ── Phase 1: rename Cloudinary assets ──────────────────────────────────
+    const fetchAll = async (resource_type) => {
+      const items = [];
+      let cursor;
+      do {
+        const r = await cloudinary.api.resources({
+          type: "upload",
+          resource_type,
+          prefix: `${from}/`,
+          max_results: 500,
+          ...(cursor ? { next_cursor: cursor } : {}),
+        });
+        items.push(...(r.resources || []));
+        cursor = r.next_cursor;
+      } while (cursor);
+      return items.map((a) => ({ ...a, resource_type }));
+    };
+
+    const allAssets = [
+      ...(await fetchAll("image")),
+      ...(await fetchAll("video")),
+    ];
+
+    // Rename in batches of 5 to stay within Cloudinary rate limits
+    for (let i = 0; i < allAssets.length; i += 5) {
+      await Promise.all(
+        allAssets.slice(i, i + 5).map(async (a) => {
+          const newId = to + a.public_id.slice(from.length);
+          try {
+            await cloudinary.uploader.rename(a.public_id, newId, {
+              resource_type: a.resource_type,
+              overwrite: false,
+            });
+            log.cloudinary.renamed++;
+          } catch (e) {
+            if (/already exists/i.test(e.message || "")) {
+              log.cloudinary.skipped++;
+            } else {
+              log.cloudinary.errors.push(`${a.public_id}: ${e.message}`);
+            }
+          }
+        }),
+      );
+    }
+
+    // ── Phase 2: update MongoDB (simple fetch-modify-save, no pipeline) ──────
+
+    // User — image URL + imagePublicId
+    const userDocs = await User.find({
+      $or: [{ image: { $regex: from } }, { imagePublicId: { $regex: from } }],
+    }).lean();
+    let userCount = 0;
+    for (const d of userDocs) {
+      const upd = {};
+      if (d.image?.includes(from)) upd.image = d.image.replaceAll(from, to);
+      if (d.imagePublicId?.includes(from))
+        upd.imagePublicId = d.imagePublicId.replaceAll(from, to);
+      if (Object.keys(upd).length) {
+        await User.updateOne({ _id: d._id }, { $set: upd });
+        userCount++;
+      }
+    }
+    log.db.users = userCount;
+
+    // Category — images[] objects
+    const CategoryModel = (await import("../models/Category.js")).default;
+    const catDocs = await CategoryModel.find({
+      "images.url": { $regex: from },
+    }).lean();
+    let catCount = 0;
+    for (const d of catDocs) {
+      await CategoryModel.updateOne(
+        { _id: d._id },
+        { $set: { images: rep(d.images) } },
+      );
+      catCount++;
+    }
+    log.db.categories = catCount;
+
+    // Product — images[] + detailedDescription (Mixed)
+    const prodDocs = await Product.find({
+      $or: [
+        { "images.url": { $regex: from } },
+        { "images.public_id": { $regex: from } },
+      ],
+    }).lean();
+    let prodCount = 0;
+    for (const d of prodDocs) {
+      const upd = {};
+      if (d.images?.length) upd.images = rep(d.images);
+      if (d.detailedDescription)
+        upd.detailedDescription = rep(d.detailedDescription);
+      if (Object.keys(upd).length) {
+        await Product.updateOne({ _id: d._id }, { $set: upd });
+        prodCount++;
+      }
+    }
+    log.db.products = prodCount;
+
+    // Review — images[] of URL strings
+    const ReviewModel = (await import("../models/Review.js")).default;
+    const reviewDocs = await ReviewModel.find({
+      images: { $elemMatch: { $regex: from } },
+    }).lean();
+    let reviewCount = 0;
+    for (const d of reviewDocs) {
+      const newImages = d.images.map((u) =>
+        u?.includes(from) ? u.replaceAll(from, to) : u,
+      );
+      await ReviewModel.updateOne(
+        { _id: d._id },
+        { $set: { images: newImages } },
+      );
+      reviewCount++;
+    }
+    log.db.reviews = reviewCount;
+
+    // BlogPost — featuredImage + additionalImages + videos + dynamicSections
+    const blogDocs = await BlogPost.find({
+      $or: [
+        { "featuredImage.url": { $regex: from } },
+        { "featuredImage.public_id": { $regex: from } },
+        { "additionalImages.url": { $regex: from } },
+        { "videos.url": { $regex: from } },
+      ],
+    }).lean();
+    let blogCount = 0;
+    for (const d of blogDocs) {
+      const upd = {};
+      if (d.featuredImage) upd.featuredImage = rep(d.featuredImage);
+      if (d.additionalImages?.length)
+        upd.additionalImages = rep(d.additionalImages);
+      if (d.videos?.length) upd.videos = rep(d.videos);
+      if (d.dynamicSections?.length)
+        upd.dynamicSections = rep(d.dynamicSections);
+      if (Object.keys(upd).length) {
+        await BlogPost.updateOne({ _id: d._id }, { $set: upd });
+        blogCount++;
+      }
+    }
+    log.db.blogposts = blogCount;
+
+    // Setting — websiteLogo + cloudinaryFolder
+    const SettingModel = (await import("../models/Setting.js")).default;
+    const settingDocs = await SettingModel.find({
+      $or: [
+        { "websiteLogo.url": { $regex: from } },
+        { "footerLogo.url": { $regex: from } },
+        { cloudinaryFolder: { $regex: from } },
+      ],
+    }).lean();
+    let settingCount = 0;
+    for (const d of settingDocs) {
+      const upd = {};
+      if (d.websiteLogo?.url?.includes(from))
+        upd.websiteLogo = rep(d.websiteLogo);
+      if (d.footerLogo?.url?.includes(from))
+        upd.footerLogo = rep(d.footerLogo);
+      if (d.cloudinaryFolder?.includes(from))
+        upd.cloudinaryFolder = d.cloudinaryFolder.replaceAll(from, to);
+      if (Object.keys(upd).length) {
+        await SettingModel.updateOne({ _id: d._id }, { $set: upd });
+        settingCount++;
+      }
+    }
+    log.db.settings = settingCount;
+
+    // Banner / PromoPanel / Popup / PromoStripItem — image.url + image.public_id
+    const patchImageModel = async (modelPath, key) => {
+      const M = (await import(modelPath)).default;
+      const docs = await M.find({
+        $or: [
+          { "image.url": { $regex: from } },
+          { "image.public_id": { $regex: from } },
+        ],
+      }).lean();
+      let count = 0;
+      for (const d of docs) {
+        const upd = {};
+        if (d.image?.url?.includes(from))
+          upd["image.url"] = d.image.url.replaceAll(from, to);
+        if (d.image?.public_id?.includes(from))
+          upd["image.public_id"] = d.image.public_id.replaceAll(from, to);
+        if (Object.keys(upd).length) {
+          await M.updateOne({ _id: d._id }, { $set: upd });
+          count++;
+        }
+      }
+      log.db[key] = count;
+    };
+    await patchImageModel("../models/Banner.js", "banners");
+    await patchImageModel("../models/PromoPanel.js", "promopanels");
+    await patchImageModel("../models/Popup.js", "popups");
+    await patchImageModel("../models/PromoStripItem.js", "promostripitems");
+
+    // OccasionSection — cards[].image
+    const OccModel = (await import("../models/OccasionSection.js")).default;
+    const occDocs = await OccModel.find({
+      "cards.image.url": { $regex: from },
+    }).lean();
+    let occCount = 0;
+    for (const d of occDocs) {
+      await OccModel.updateOne(
+        { _id: d._id },
+        { $set: { cards: rep(d.cards) } },
+      );
+      occCount++;
+    }
+    log.db.occasionsections = occCount;
+
+    res.json({ ok: true, log });
+  } catch (err) {
+    res.status(500).json({ error: err.message, log });
+  }
+});
+
+export default router;

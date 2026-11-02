@@ -1,0 +1,293 @@
+import mongoose from "mongoose";
+import { nextOrderNumber } from "../lib/orderNumber.js";
+
+const OrderItemSchema = new mongoose.Schema(
+  {
+    productId: String,
+    title: String,
+    price: Number,
+    quantity: Number,
+    image: String,
+    color: { type: String, default: null },
+    size: { type: String, default: null },
+    // Standalone single generic-group variant (legacy: e.g. Type=Charging).
+    attrGroup: { type: String, default: null },
+    attrValue: { type: String, default: null },
+    // Combinable multi-dimensional selection, e.g. { Color: "White", Type: "8 Pin" }.
+    // Stored as a plain object (not a Map) so it serialises cleanly in every
+    // res.json()/toObject() path — Maps flatten to {} in some of them.
+    attributes: { type: Object, default: undefined },
+    rewardPoints: { type: Number, default: 0 },
+    isPreorder: { type: Boolean, default: false },
+  },
+  { _id: false },
+);
+
+const BillingSchema = new mongoose.Schema(
+  {
+    name: String,
+    phone: String,
+    email: String,
+    city: String,
+    zone: String,
+    area: String,
+    address: String,
+    note: String,
+  },
+  { _id: false },
+);
+
+const AppliedCouponSchema = new mongoose.Schema(
+  {
+    code: String,
+    discountValue: Number,
+  },
+  { _id: false },
+);
+
+const TrackingEventSchema = new mongoose.Schema(
+  {
+    status: String,
+    message: String,
+    at: { type: Date, default: Date.now },
+    source: {
+      type: String,
+      enum: ["admin", "courier", "system"],
+      default: "courier",
+    },
+  },
+  { _id: false },
+);
+
+const StatusHistorySchema = new mongoose.Schema(
+  {
+    previousStatus: { type: String, default: null },
+    newStatus: { type: String, required: true },
+    reason: { type: String, default: "" },
+    changedBy: { type: String, default: "system" },
+    at: { type: Date, default: Date.now },
+  },
+  { _id: false },
+);
+
+const EditedBySchema = new mongoose.Schema(
+  {
+    name: { type: String, default: "" },
+    at: { type: Date, default: Date.now },
+  },
+  { _id: false },
+);
+
+const AssignedAgentSchema = new mongoose.Schema(
+  {
+    agentId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "OrderAgent",
+      default: null,
+    },
+    name: { type: String, default: null },
+    phone: { type: String, default: null },
+    courierName: { type: String, default: null },
+    assignedAt: { type: Date, default: null },
+  },
+  { _id: false },
+);
+
+const ReturnRequestSchema = new mongoose.Schema(
+  {
+    reason: { type: String, default: "" },
+    requestedAt: { type: Date, default: Date.now },
+    status: {
+      type: String,
+      enum: ["pending", "approved", "rejected"],
+      default: "pending",
+    },
+    refundAmount: { type: Number, default: 0 },
+    adminNote: { type: String, default: "" },
+    resolvedAt: { type: Date, default: null },
+    resolvedBy: { type: String, default: "" },
+  },
+  { _id: false },
+);
+
+const PickedBySchema = new mongoose.Schema(
+  {
+    adminId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Admin",
+      default: null,
+    },
+    name: { type: String, default: null },
+    pickedAt: { type: Date, default: null },
+  },
+  { _id: false },
+);
+
+const FollowUpPersonSchema = new mongoose.Schema(
+  {
+    adminId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Admin",
+      default: null,
+    },
+    name: { type: String, default: null },
+    email: { type: String, default: null },
+    assignedAt: { type: Date, default: null },
+  },
+  { _id: false },
+);
+
+const FollowUpHistorySchema = new mongoose.Schema(
+  {
+    action: {
+      type: String,
+      enum: ["assigned", "called", "accepted", "rejected"],
+      required: true,
+    },
+    reason: { type: String, default: "" },
+    notes: { type: String, default: "" },
+    byAdminId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    byName: { type: String, default: "" },
+    at: { type: Date, default: Date.now },
+  },
+  { _id: false },
+);
+
+const ShipmentSchema = new mongoose.Schema(
+  {
+    courier: {
+      type: String,
+      default: null,
+    },
+    trackingId: { type: String, default: null },
+    trackingUrl: { type: String, default: null },
+    courierStatus: { type: String, default: null },
+    handedToCourierAt: { type: Date, default: null },
+    deliveredAt: { type: Date, default: null },
+    lastSyncAt: { type: Date, default: null },
+    bookedAt: { type: Date, default: null },
+    bookingSource: {
+      type: String,
+      enum: ["api", "manual"],
+      default: null,
+    },
+    trackingEvents: { type: [TrackingEventSchema], default: [] },
+  },
+  { _id: false },
+);
+
+const OrderSchema = new mongoose.Schema({
+  // Human-friendly sequential order id (e.g. "apl1001"). Shown everywhere in
+  // the storefront/dashboard and sent to couriers as the merchant invoice id.
+  // Assigned automatically on creation (see pre-save hook); unique + sparse so
+  // any pre-migration order without one doesn't collide on null.
+  orderNumber: { type: String, unique: true, sparse: true },
+  userId: { type: String, default: null }, // MongoDB _id as string (may be null for guests)
+  userEmail: { type: String, default: null },
+  items: { type: [OrderItemSchema], required: true },
+  billingDetails: { type: BillingSchema, required: true },
+  subtotal: { type: Number, required: true },
+  shipping: { type: Number, default: 0 },
+  discount: { type: Number, default: 0 },
+  total: { type: Number, required: true },
+  paymentMethod: {
+    type: String,
+    enum: ["cash-on-delivery", "online", "bkash", "nagad", "rocket"],
+    default: "cash-on-delivery",
+  },
+  couponCode: { type: String, default: null },
+  appliedCoupons: { type: [AppliedCouponSchema], default: [] },
+  status: {
+    type: String,
+    enum: [
+      "pending",
+      "accepted",
+      "picked",
+      "approved",
+      "rejected",
+      "confirmed",
+      "processing",
+      "shipped",
+      "delivered",
+      "returned",
+      "failed",
+      "cancelled",
+    ],
+    default: "pending",
+  },
+  paymentStatus: {
+    type: String,
+    enum: [
+      "unpaid",
+      "cod",
+      "paid",
+      "failed",
+      "cancelled",
+      "pending_verification",
+    ],
+    default: "unpaid",
+  },
+  transactionId: { type: String, default: null },
+  paymentNote: { type: String, default: null },
+  valId: { type: String, default: null },
+  paidAmount: { type: Number, default: null },
+  // Deadline for the customer's self edit/cancel window (COD = 1 hour after
+  // creation). Purely informational — it does NOT auto-confirm; the order stays
+  // "pending" until staff change it. After this time edit/cancel is rejected.
+  confirmAfter: { type: Date, default: null },
+  shipment: { type: ShipmentSchema, default: () => ({ trackingEvents: [] }) },
+  assignedAgent: { type: AssignedAgentSchema, default: null },
+  pickedBy: { type: PickedBySchema, default: null },
+  followUp: { type: FollowUpPersonSchema, default: null },
+  followUpStatus: {
+    type: String,
+    enum: ["unassigned", "assigned", "called", "accepted", "rejected"],
+    default: "unassigned",
+  },
+  followUpHistory: { type: [FollowUpHistorySchema], default: [] },
+  rewardPointsEarned: { type: Number, default: 0 },
+  rewardPointsRedeemed: { type: Number, default: 0 },
+  rewardPointsDiscount: { type: Number, default: 0 },
+  rewardPointsCredited: { type: Boolean, default: false },
+  rewardPointsCreditedAt: { type: Date, default: null },
+  statusHistory: { type: [StatusHistorySchema], default: [] },
+  // Admins/moderators who have edited this order (status, line-items, customer,
+  // payment). Most-recent last; the dashboard shows the latest few as "by X".
+  editedBy: { type: [EditedBySchema], default: [] },
+  returnRequest: { type: ReturnRequestSchema, default: null },
+  clientIp: { type: String, default: "" },
+  deviceId: { type: String, default: "" },
+  userAgent: { type: String, default: "" },
+
+  // soft-delete / recycle bin — when deletedAt is set the order lives in
+  // "trash": hidden from the orders dashboard + its stats, but kept in the DB
+  // so it can be restored within the retention window. A cron job permanently
+  // removes orders whose deletedAt is older than the window.
+  deletedAt: { type: Date, default: null },
+  deletedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Admin" },
+
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now },
+});
+
+OrderSchema.pre("save", async function () {
+  this.updatedAt = new Date();
+  if (this.isNew && !this.orderNumber) {
+    this.orderNumber = await nextOrderNumber();
+  }
+});
+
+// Compound indexes for dashboard queries and fraud-prevention lookups
+OrderSchema.index({ "billingDetails.phone": 1, createdAt: -1 });
+OrderSchema.index({ clientIp: 1, createdAt: -1 });
+OrderSchema.index({ deviceId: 1, createdAt: -1 });
+OrderSchema.index({ userId: 1, status: 1 });
+OrderSchema.index({ userId: 1, createdAt: -1 }); // fast "my orders" sort
+OrderSchema.index({ status: 1, createdAt: -1 });
+OrderSchema.index({ deletedAt: 1, createdAt: -1 }); // trash listing + cron cleanup
+OrderSchema.index({ userEmail: 1, createdAt: -1 });
+OrderSchema.index({ paymentStatus: 1, createdAt: -1 });
+OrderSchema.index({ "shipment.trackingId": 1 }, { sparse: true }); // webhook lookups
+OrderSchema.index({ confirmAfter: 1 }, { sparse: true }); // lazy-confirm batch job
+
+export default mongoose.models.Order || mongoose.model("Order", OrderSchema);
