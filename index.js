@@ -66,7 +66,7 @@ app.set("trust proxy", 1);
 const ALLOWED_ORIGINS = new Set(
   (
     process.env.ALLOWED_ORIGINS ||
-    "https://applebd.com,https://www.applebd.com,http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173"
+    "https://applebd.com,https://www.applebd.com,http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173, https://apple-bd.vercel.app"
   )
     .split(",")
     .map((o) => o.trim())
