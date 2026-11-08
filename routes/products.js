@@ -213,8 +213,8 @@ router.get("/", async (req, res) => {
       topSold: { monthlySold: -1, _id: -1 },
       nameAsc: { title: 1, _id: 1 },
       nameDesc: { title: -1, _id: -1 },
-      priceHigh: { price: -1, _id: -1 },
-      priceLow: { price: 1, _id: 1 },
+      priceHigh: { displaySortPrice: -1, _id: -1 },
+      priceLow: { displaySortPrice: 1, _id: 1 },
     };
     const sortBy = sortMap[sort] || sortMap.position;
 
@@ -235,13 +235,52 @@ router.get("/", async (req, res) => {
       }
     }
 
+    const itemsQuery =
+      sort === "priceHigh" || sort === "priceLow"
+        ? Product.aggregate([
+            { $match: filter },
+            {
+              $addFields: {
+                displaySortPrice: {
+                  $let: {
+                    vars: {
+                      pricedVariants: {
+                        $filter: {
+                          input: { $ifNull: ["$variants", []] },
+                          as: "variant",
+                          cond: { $gt: [{ $ifNull: ["$$variant.price", 0] }, 0] },
+                        },
+                      },
+                    },
+                    in: {
+                      $ifNull: [
+                        { $arrayElemAt: ["$$pricedVariants.price", 0] },
+                        { $ifNull: ["$price", 0] },
+                      ],
+                    },
+                  },
+                },
+              },
+            },
+            { $sort: sortBy },
+            { $skip: Number(skip) },
+            { $limit: Number(limit) },
+            {
+              $project: Object.fromEntries(
+                CARD_SELECT.split(/\s+/).map((field) => [field, 1]),
+              ),
+            },
+          ]).collation({ locale: "en", strength: 2 })
+        : Product.find(filter)
+            .select(CARD_SELECT)
+            .sort(sortBy)
+            .collation({ locale: "en", strength: 2 })
+            .skip(Number(skip))
+            .limit(Number(limit))
+            .lean();
+
     const [items, total] = await Promise.all([
-      Product.find(filter)
-        .select(CARD_SELECT)
-        .sort(sortBy)
-        .skip(Number(skip))
-        .limit(Number(limit))
-        .lean(),
+      itemsQuery,
       Product.countDocuments(filter),
     ]);
 

@@ -3,6 +3,7 @@ import jwt from "jsonwebtoken";
 import multer from "multer";
 import {
   saveLocalUpload,
+  saveCloudinaryUpload,
   requestUploadBase,
   destroyAsset,
 } from "../lib/assetStore.js";
@@ -41,19 +42,22 @@ const requireUser = async (req, res, next) => {
   }
 };
 
-// Upload an avatar/review image (logged-in users). Stored on the backend's
-// local disk under a restricted set of folders and served from /uploads.
+// Upload an avatar/review image (logged-in users). Profile avatars use
+// Cloudinary so they remain reachable across browsers and backend instances;
+// review images continue using the backend's local uploads storage.
 router.post("/upload", requireUser, upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
     const folder = resolveUserFolder(req.body.folder || req.query.folder);
-    const asset = await saveLocalUpload({
-      buffer: req.file.buffer,
-      mimetype: req.file.mimetype,
-      originalName: req.file.originalname,
-      folder,
-      baseUrl: requestUploadBase(req),
-    });
+    const asset = folder.endsWith("/profiles")
+      ? await saveCloudinaryUpload({ buffer: req.file.buffer, folder })
+      : await saveLocalUpload({
+          buffer: req.file.buffer,
+          mimetype: req.file.mimetype,
+          originalName: req.file.originalname,
+          folder,
+          baseUrl: requestUploadBase(req),
+        });
     res.json({ ok: true, asset });
   } catch (err) {
     res
@@ -103,15 +107,14 @@ router.put(
       if (req.file) {
         let asset;
         try {
-          asset = await saveLocalUpload({
+          asset = await saveCloudinaryUpload({
             buffer: req.file.buffer,
-            mimetype: req.file.mimetype,
-            originalName: req.file.originalname,
             folder: `${process.env.CLOUDINARY_FOLDER || "applebd"}/profiles`,
-            baseUrl: requestUploadBase(req),
           });
         } catch (uploadErr) {
-          return res.status(400).json({ error: "Invalid image file" });
+          return res.status(400).json({
+            error: uploadErr.message || "Profile image upload failed.",
+          });
         }
 
         // delete old image if existed

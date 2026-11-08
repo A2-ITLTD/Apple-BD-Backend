@@ -21,13 +21,18 @@ router.post('/firebase-login', async (req, res) => {
     const { email, name, image, provider } = req.body || {};
     if (!email) return res.status(400).json({ error: 'Email is required' });
 
+    const existingUser = await User.findOne({ email });
     const update = {
       email,
       name,
-      image,
       provider: provider || 'firebase',
       isVerified: true
     };
+    // A user may replace their Firebase/Google avatar with a profile photo.
+    // Do not reset that saved photo every time they log in or refresh auth.
+    if (!existingUser?.image && !existingUser?.imagePublicId && image) {
+      update.image = image;
+    }
 
     const user = await User.findOneAndUpdate({ email }, update, { upsert: true, new: true, setDefaultsOnInsert: true }).populate('tags');
 

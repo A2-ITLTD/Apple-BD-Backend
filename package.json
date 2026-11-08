@@ -7,7 +7,8 @@
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js",
-    "seed:admin": "node seedAdmin.js"
+    "seed:admin": "node seedAdmin.js",
+    "db:diagnostic": "node scripts/databaseDiagnostic.js"
   },
   "dependencies": {
     "bcrypt": "^5.1.0",
