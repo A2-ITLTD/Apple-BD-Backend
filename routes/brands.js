@@ -8,12 +8,14 @@ const router = express.Router();
 router.get('/', async (req, res) => {
   try {
     const { type, featured, limit = 50, page = 1 } = req.query;
+    const pageSize = Math.min(100, Math.max(1, Number.parseInt(limit, 10) || 50));
+    const pageNumber = Math.max(1, Number.parseInt(page, 10) || 1);
     const filter = { isActive: true };
     if (type) filter.type = type;
     if (featured === 'true') filter.isFeatured = true;
-    const skip = (Math.max(1, page) - 1) * Number(limit);
+    const skip = (pageNumber - 1) * pageSize;
     const [brands, total] = await Promise.all([
-      Brand.find(filter).sort({ order: 1, name: 1 }).skip(skip).limit(Number(limit)).lean(),
+      Brand.find(filter).sort({ order: 1, name: 1 }).skip(skip).limit(pageSize).lean(),
       Brand.countDocuments(filter),
     ]);
     res.json({ brands, total });

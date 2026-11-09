@@ -8,7 +8,9 @@ const router = express.Router();
 router.get('/', async (req, res) => {
   try {
     const { page = 1, limit = 10, q, tag, category, featured, sort } = req.query;
-    const skip = (Math.max(1, page) - 1) * limit;
+    const pageNumber = Math.max(1, Number.parseInt(page, 10) || 1);
+    const pageSize = Math.min(50, Math.max(1, Number.parseInt(limit, 10) || 10));
+    const skip = (pageNumber - 1) * pageSize;
     const filter = { status: 'published' };
     if (q) filter.$or = [ { title: new RegExp(q, 'i') }, { excerpt: new RegExp(q, 'i') }, { content: new RegExp(q, 'i') } ];
     if (tag) filter.tags = tag;
@@ -22,10 +24,10 @@ router.get('/', async (req, res) => {
     const sortObj = sort === 'title' ? { title: 1 } : { publishedAt: -1 };
 
     const [items, total] = await Promise.all([
-      BlogPost.find(filter).sort(sortObj).skip(Number(skip)).limit(Number(limit)).lean(),
+      BlogPost.find(filter).sort(sortObj).skip(skip).limit(pageSize).lean(),
       BlogPost.countDocuments(filter)
     ]);
-    res.json({ items, total, page: Number(page), limit: Number(limit) });
+    res.json({ items, total, page: pageNumber, limit: pageSize });
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
@@ -68,6 +70,7 @@ router.get('/:slug/related', async (req, res) => {
   try {
     const slug = req.params.slug;
     const { limit = 3 } = req.query;
+    const pageSize = Math.min(20, Math.max(1, Number.parseInt(limit, 10) || 3));
     
     // First get the current blog post
     const currentPost = await BlogPost.findOne({ slug, status: 'published' }).lean();
@@ -95,12 +98,12 @@ router.get('/:slug/related', async (req, res) => {
     // Fetch related posts, sorted by most recent
     const relatedPosts = await BlogPost.find(relatedQuery)
       .sort({ publishedAt: -1 })
-      .limit(Number(limit))
+      .limit(pageSize)
       .select('title slug excerpt featuredImage featuredImageLegacy author publishedAt readingTime tags')
       .lean();
     
     // If we don't have enough related posts, fill with latest posts
-    if (relatedPosts.length < Number(limit)) {
+    if (relatedPosts.length < pageSize) {
       const additionalPosts = await BlogPost.find({
         status: 'published',
         _id: { 
@@ -108,7 +111,7 @@ router.get('/:slug/related', async (req, res) => {
         }
       })
         .sort({ publishedAt: -1 })
-        .limit(Number(limit) - relatedPosts.length)
+        .limit(pageSize - relatedPosts.length)
         .select('title slug excerpt featuredImage featuredImageLegacy author publishedAt readingTime tags')
         .lean();
       

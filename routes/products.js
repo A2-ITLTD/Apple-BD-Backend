@@ -87,7 +87,11 @@ router.get("/", async (req, res) => {
       crueltyFree,
       vegan,
     } = req.query;
-    const skip = (Math.max(1, page) - 1) * limit;
+    // Preserve normal storefront request sizes while preventing callers from
+    // asking MongoDB to return an arbitrarily large page.
+    const pageNumber = Math.max(1, Number.parseInt(page, 10) || 1);
+    const pageSize = Math.min(100, Math.max(1, Number.parseInt(limit, 10) || 20));
+    const skip = (pageNumber - 1) * pageSize;
     const filter = { deletedAt: null }; // never surface trashed products
     if (status) filter.status = status;
     // Fetch a specific set of products by id (comma-separated). Used by admin
@@ -264,7 +268,7 @@ router.get("/", async (req, res) => {
             },
             { $sort: sortBy },
             { $skip: Number(skip) },
-            { $limit: Number(limit) },
+            { $limit: pageSize },
             {
               $project: Object.fromEntries(
                 CARD_SELECT.split(/\s+/).map((field) => [field, 1]),
@@ -276,7 +280,7 @@ router.get("/", async (req, res) => {
             .sort(sortBy)
             .collation({ locale: "en", strength: 2 })
             .skip(Number(skip))
-            .limit(Number(limit))
+            .limit(pageSize)
             .lean();
 
     const [items, total] = await Promise.all([
@@ -287,8 +291,8 @@ router.get("/", async (req, res) => {
     const payload = {
       items: items.map(stripBuyingPrice),
       total,
-      page: Number(page),
-      limit: Number(limit),
+      page: pageNumber,
+      limit: pageSize,
     };
     // store in cache (short TTL)
     if (redisClient?.isReady) {

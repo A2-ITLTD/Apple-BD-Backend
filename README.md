@@ -750,7 +750,7 @@ CLOUDINARY_CLOUD_NAME=dqyaobg8j
 # FRONTEND_ORIGIN=https://AppleBDfrontend-ei5y.vercel.app
 
 FRONTEND_ORIGIN=http://localhost:3000
-MONGODB_URI="mongodb://AppleBD:AppleBD@ac-uarjbv7-shard-00-00.txpmesm.mongodb.net:27017,ac-uarjbv7-shard-00-01.txpmesm.mongodb.net:27017,ac-uarjbv7-shard-00-02.txpmesm.mongodb.net:27017/AppleBD?ssl=true&replicaSet=atlas-ji89w4-shard-0&authSource=admin&retryWrites=true&w=majority"
+MONGODB_URI=
 PORT=5000
 SMTP_HOST=smtp.gmail.com
 SMTP_PASS="obsi iufk hodz hses"
