@@ -97,10 +97,11 @@ router.put(
 
       // handle image removal request (only if no new file is being uploaded)
       const wantsRemoveImage = removeImage === "1" || removeImage === "true";
-      if (!req.file && wantsRemoveImage && u.imagePublicId) {
-        await destroyAsset(u.imagePublicId);
+      if (!req.file && wantsRemoveImage) {
+        if (u.imagePublicId) await destroyAsset(u.imagePublicId);
         u.image = undefined;
         u.imagePublicId = undefined;
+        u.profileImageRemoved = true;
       }
 
       // handle image upload if provided (takes precedence over removal flag)
@@ -122,6 +123,7 @@ router.put(
 
         u.image = asset.url;
         u.imagePublicId = asset.public_id;
+        u.profileImageRemoved = false;
       } else if (
         typeof req.body?.imageUrl === "string" &&
         req.body.imageUrl.startsWith("http")
@@ -133,6 +135,7 @@ router.put(
         }
         u.image = req.body.imageUrl;
         u.imagePublicId = req.body.imagePublicId || undefined;
+        u.profileImageRemoved = false;
       }
 
       await u.save();

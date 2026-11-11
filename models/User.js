@@ -7,6 +7,9 @@ const UserSchema = new mongoose.Schema({
   dob: { type: String },
   image: { type: String },
   imagePublicId: { type: String },
+  // Prevent Firebase/Google login from restoring the provider avatar after the
+  // user explicitly removes their profile photo.
+  profileImageRemoved: { type: Boolean, default: false },
   role: { type: String, enum: ["user", "admin", "moderator"], default: "user" },
   provider: {
     type: String,

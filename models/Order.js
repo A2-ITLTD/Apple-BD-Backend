@@ -177,7 +177,7 @@ const ShipmentSchema = new mongoose.Schema(
 );
 
 const OrderSchema = new mongoose.Schema({
-  // Human-friendly sequential order id (e.g. "apl1001"). Shown everywhere in
+  // Human-friendly sequential order id (e.g. "apl-1675"). Shown everywhere in
   // the storefront/dashboard and sent to couriers as the merchant invoice id.
   // Assigned automatically on creation (see pre-save hook); unique + sparse so
   // any pre-migration order without one doesn't collide on null.

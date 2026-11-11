@@ -4,7 +4,7 @@ import mongoose from "mongoose";
 // "orderNumber"); `seq` is bumped with $inc so concurrent orders never collide.
 const CounterSchema = new mongoose.Schema({
   _id: { type: String }, // counter name
-  seq: { type: Number, default: 1674 }, // first order becomes seq+1 = apl1675
+  seq: { type: Number, default: 1674 }, // first order becomes seq+1 = apl-1675
 });
 
 export default mongoose.models.Counter ||

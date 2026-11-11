@@ -4191,15 +4191,31 @@ router.put(
   async (req, res) => {
     try {
       const Popup = (await import("../models/Popup.js")).default;
-      const { image, link, isActive } = req.body;
+      const { image, link, isActive, delaySeconds, durationSeconds } = req.body;
+      const validSeconds = (value, min) =>
+        value === undefined ||
+        (Number.isInteger(Number(value)) && Number(value) >= min && Number(value) <= 300);
+      if (!validSeconds(delaySeconds, 0) || !validSeconds(durationSeconds, 1)) {
+        return res.status(400).json({
+          error: "Popup timing must be whole seconds from 0–300 (delay) and 1–300 (duration).",
+        });
+      }
       let popup = await Popup.findOne();
       if (popup) {
         if (image !== undefined) popup.image = image;
         if (link !== undefined) popup.link = link;
         if (isActive !== undefined) popup.isActive = isActive;
+        if (delaySeconds !== undefined) popup.delaySeconds = Number(delaySeconds);
+        if (durationSeconds !== undefined) popup.durationSeconds = Number(durationSeconds);
         await popup.save();
       } else {
-        popup = await new Popup({ image, link, isActive }).save();
+        popup = await new Popup({
+          image,
+          link,
+          isActive,
+          delaySeconds: delaySeconds === undefined ? 3 : Number(delaySeconds),
+          durationSeconds: durationSeconds === undefined ? 6 : Number(durationSeconds),
+        }).save();
       }
       res.json({ ok: true, popup });
     } catch (err) {

@@ -24,13 +24,20 @@ router.post('/firebase-login', async (req, res) => {
     const existingUser = await User.findOne({ email });
     const update = {
       email,
-      name,
       provider: provider || 'firebase',
       isVerified: true
     };
+    // Firebase's display name is only an initial default. Once the customer
+    // edits their profile name, keep that saved value across future logins.
+    if (!existingUser?.name && name) update.name = name;
     // A user may replace their Firebase/Google avatar with a profile photo.
     // Do not reset that saved photo every time they log in or refresh auth.
-    if (!existingUser?.image && !existingUser?.imagePublicId && image) {
+    if (
+      !existingUser?.image &&
+      !existingUser?.imagePublicId &&
+      !existingUser?.profileImageRemoved &&
+      image
+    ) {
       update.image = image;
     }
 

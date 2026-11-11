@@ -1668,7 +1668,7 @@ router.get("/track", async (req, res) => {
 router.get("/:id", async (req, res) => {
   try {
     // Accept either the raw ObjectId or the human-friendly order number
-    // (e.g. "apl0023"), so the public confirmation URL can use the clean id.
+    // (e.g. "apl-1675"), so the public confirmation URL can use the clean id.
     const order = await findOrderByIdOrSuffix(req.params.id);
     if (!order) return res.status(404).json({ error: "Order not found" });
 
