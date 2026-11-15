@@ -55,7 +55,13 @@ const isDhaka = (city) =>
 
 // Case-insensitive/trim match helper for zone & area names.
 const sameName = (a, b) =>
-  !!a && !!b && a.trim().toLowerCase() === b.trim().toLowerCase();
+  !!a &&
+  !!b &&
+  a
+    .trim()
+    .toLowerCase()
+    .replace(/ corporat$/, " corporation") ===
+    b.trim().toLowerCase().replace(/ corporat$/, " corporation");
 
 /**
  * Location-aware base shipping, driven by the admin-configured
@@ -73,7 +79,7 @@ const calcBaseShipping = async (city, zone, area) => {
   const Setting = (await import("../models/Setting.js")).default;
   const settings = await Setting.findOne().select("deliveryCharge").lean();
   const config = settings?.deliveryCharge || {};
-  const insideDhaka = config.insideDhaka ?? 70;
+  const insideDhaka = config.insideDhaka ?? 80;
   const outsideDhaka = config.outsideDhaka ?? 130;
 
   if (!isDhaka(city)) return outsideDhaka;

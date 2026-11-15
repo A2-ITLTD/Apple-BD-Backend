@@ -74,7 +74,7 @@ const SettingsSchema = new mongoose.Schema({
   lowStockThreshold: { type: Number, default: 5 },
   defaultShipping: { type: Number, default: 0 },
   deliveryCharge: {
-    insideDhaka: { type: Number, default: 70 },
+    insideDhaka: { type: Number, default: 80 },
     outsideDhaka: { type: Number, default: 130 },
     zones: {
       type: [
