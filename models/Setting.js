@@ -456,6 +456,15 @@ const SettingsSchema = new mongoose.Schema({
     timerEnabled: { type: Boolean, default: false },
     timerEndsAt: { type: String, default: "" },
   },
+  // Shared poster displayed below the image gallery on every product detail page.
+  productDetailPoster: {
+    enabled: { type: Boolean, default: false },
+    image: {
+      url: { type: String, default: "" },
+      public_id: { type: String, default: "" },
+    },
+    link: { type: String, default: "" },
+  },
   // Tabbed "Featured Products" showcase shown right after the category grid on
   // the homepage (Starbucks-style curved panel). Rendered by
   // components/home/FeaturedShowcase.jsx; served resolved via

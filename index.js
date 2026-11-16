@@ -637,6 +637,19 @@ app.get("/api/promo-banner", async (req, res) => {
   }
 });
 
+// Public: shared poster shown below the image gallery on product detail pages.
+app.get("/api/product-detail-poster", async (req, res) => {
+  try {
+    const { default: Setting } = await import("./models/Setting.js");
+    const s = await Setting.findOne().lean();
+    const cfg = s?.productDetailPoster;
+    if (!cfg?.enabled || !cfg.image?.url) return res.json({ poster: null });
+    res.json({ poster: { image: cfg.image, link: cfg.link || "" } });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 // Public: tabbed "Featured Products" showcase (homepage, after categories).
 // Resolves each tab's products server-side so the storefront just renders.
 // Returns { showcase: null } when disabled or when no tab has any products.

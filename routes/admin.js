@@ -505,6 +505,7 @@ router.put("/settings", requireAdmin, async (req, res) => {
 // admin-only. Admins pass every check (hasPermission → true for role "admin").
 const STOREFRONT_SETTING_PERMISSIONS = {
   promoBanner: ["content"], // Promo banner
+  productDetailPoster: ["content"], // Shared product detail poster
   typographicHero: ["content"], // Typographic hero
   featuredShowcase: ["content"], // Featured showcase
   categoryShowcase: ["content"], // Category showcase
