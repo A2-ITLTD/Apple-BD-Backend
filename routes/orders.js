@@ -16,6 +16,7 @@ import {
   sendOrderCancelledEmail,
 } from "../lib/mailer.js";
 import { syncOrderShipment } from "../lib/shipmentTracking.js";
+import { applyCourierStatusToOrder } from "../lib/courierStatusMap.js";
 import { requirePermission } from "../lib/permissions.js";
 import { getCourierLabelMap } from "../lib/courierDefaults.js";
 import {
@@ -1537,13 +1538,14 @@ router.post("/webhooks/steadfast", async (req, res) => {
 
     order.shipment.courierStatus = String(message);
     order.shipment.lastSyncAt = new Date();
+    await applyCourierStatusToOrder(
+      order,
+      payload.status || message,
+      "steadfast",
+    );
 
-    // DISPLAY-ONLY: the webhook records the courier's raw status + tracking event
-    // history, but must never change the business order status. Substring matching
-    // on status_type (e.g. .includes("deliver")) wrongly matched phrases like
-    // "At Delivery Hub" / "Out for Delivery" and flipped orders to "delivered".
-    // Order status now changes only through a manual admin/moderator action
-    // (PUT /api/admin/orders/:id/status), which records changedBy in the history.
+    // Only exact, known courier phrases advance the internal order status
+    // (see courierStatusMap.js). Ambiguous tracking messages stay display-only.
 
     order.updatedAt = new Date();
     await order.save();
@@ -1576,6 +1578,7 @@ router.post("/webhooks/pathao", async (req, res) => {
       payload.order_status ||
       payload.order_status_slug ||
       payload.status ||
+      payload.event ||
       null;
 
     if (!consignmentId) {
@@ -1594,6 +1597,7 @@ router.post("/webhooks/pathao", async (req, res) => {
     await syncOrderShipment(order, { force: true });
     if (courierStatus) {
       order.shipment.courierStatus = String(courierStatus);
+      await applyCourierStatusToOrder(order, courierStatus, "pathao");
       await order.save();
     }
 

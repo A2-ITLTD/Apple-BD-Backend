@@ -8,7 +8,8 @@
     "start": "node index.js",
     "dev": "nodemon index.js",
     "seed:admin": "node seedAdmin.js",
-    "db:diagnostic": "node scripts/databaseDiagnostic.js"
+    "db:diagnostic": "node scripts/databaseDiagnostic.js",
+    "db:backfill-status": "node scripts/backfillCourierStatus.js"
   },
   "dependencies": {
     "bcrypt": "^5.1.0",
